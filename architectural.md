@@ -1070,6 +1070,128 @@ system." *A cyan/Geist-themed Meridian UI matching the console* — rejected del
 distinct light enterprise theme makes the demo's two systems ("the client's app" vs. "IntelliOps
 watching it") legible at a glance, which matters for an audience seeing both for the first time.
 
+### ADR-021 — Evidence exposure & honesty pass
+
+**Context.** An adversarial audit set out to answer one question: if someone opened the console
+and asked "prove this is real," could it? The engine underneath was genuinely real — 414+ tests,
+a live correlator, RCA rules running against real telemetry, real (dry-run) remediation — but the
+read-model *projection* (`services/read/projection.py`) that feeds the console was throwing away
+every rich signal at the exact boundary where a human would look for proof. Member telemetry
+events were collapsed to a bare count. A hypothesis's supporting evidence and its LLM (or
+template) explanation were computed and then discarded. The correlator's peak z-score was computed
+against a real baseline and then reset without ever being attached to the emitted `Situation`. The
+remediation outcome was appended to a global outcomes list but never joined back onto the situation
+it belonged to, so a resolved incident's own record couldn't say what actually happened to it. On
+top of the missing evidence, two UI bugs made the console actively misleading rather than merely
+uninformative: the approve/reject gate reappeared on a situation that had already been decided, and
+the outcome panel rendered hardcoded `"healthy"` / `"aborted"` text regardless of what the backend
+reported. Separately, the LLM-assisted explanation path ([ADR-019](#adr-019--pluggable-detectors-the-finetuning-loop-and-llm-assisted-rca))
+was dormant and invisible by default — nothing in the compose stack or the console told an operator
+whether an explanation came from a real model or the offline template, or how to turn a real one on.
+
+**Decision.** Fix this by widening the read-model projection, not by touching engine logic —
+`CorrelationEngine`, `rank_hypotheses`, and the remediation playbooks are unchanged. Every new
+field is an additive, optional contract field with a test-safe default, the same discipline that
+keeps contract changes cheap and keeps the existing suite green
+([ADR-006](#adr-006--monorepo-with-a-shared-common-library),
+[ADR-012](#adr-012--config-switched-adapter-selection-with-test-safe-defaults)). Concretely:
+
+- The projection now carries each member event's real `name`, `value`, `labels`, and `kind`
+  instead of a count, and attaches the correlator's peak z-score plus the baseline it was measured
+  against to the `Situation` it belongs to.
+- A diagnosed situation's ranked hypotheses keep their evidence list and their explanation text
+  (labeled by source — LLM or template) all the way to the read model, instead of being summarized
+  away.
+- The real remediation outcome — result, executed steps, and mode (dry-run vs. live) — is joined
+  onto its situation by id, alongside a stage timeline, and the read model resolves a readable
+  title instead of the raw signature.
+- Three new read-only introspection endpoints expose the internals directly: read's
+  `GET /situations/{id}` (the full per-incident record) and `GET /system` (live correlator
+  baselines, configured backends, remediation mode, LLM provider status), plus correlation's
+  `GET /baseline`. Governance's `GET /audit` already existed and needed no change.
+- The LLM explanation provider becomes live-configurable instead of boot-time-only: RCA gets
+  `POST /config/llm` and `POST /config/llm/test`, backed by a `ProviderHolder` — a small
+  lock-guarded holder the daemon consumer re-reads every iteration and the request thread writes
+  to, so swapping providers takes effect without a restart. Both endpoints sit behind the existing
+  edge auth ([ADR-017](#adr-017--edge-authentication)) and the response never echoes the
+  `api_key` back, configured or not.
+- The console's drill-down and a new System view are built on top of these endpoints; the
+  reappearing-approve-gate and hardcoded-outcome-text bugs are fixed as part of the same pass,
+  since they were found during the same audit and are console-side, not projection-side.
+
+**Why.** The rule this pass enforces is simple: no fabricated numbers in live mode, and every
+number or claim the console shows must trace to a real source — a metric, a stored evidence
+record, a stored outcome, or a value explicitly labeled as a dry-run simulation. Widening the
+projection rather than changing the engine keeps the blast radius small and testable: the engine's
+own 414+ tests are untouched, and the new fields default to shapes the existing tests and mock mode
+already produce, so nothing that passed before this pass can start failing because of it. This
+followed the same reasoning as [ADR-012](#adr-012--config-switched-adapter-selection-with-test-safe-defaults) —
+new behavior is additive and defaults to the old behavior — and the same contract discipline as
+[ADR-006](#adr-006--monorepo-with-a-shared-common-library), where shared shapes live in one place
+so a change to them is one edit reviewed once rather than drift across services. The LLM stays
+**off by default** — an offline template explanation ships out of the box, which is the honest
+default for a system with no API key configured — and turning it on is opt-in, either via the
+compose environment variables or live from the console's System view, never assumed.
+
+### ADR-022 — Slim per-service Docker images
+
+**Context.** All 13 compose services built from the same `Dockerfile`, so all 13 shipped the same
+dependency set — including `numpy`, `scikit-learn`, `river`, `joblib`, and the `kubernetes` client,
+libraries only `correlation` (trained/robust anomaly detection) and `action` (the k8s remediator
+adapter) actually import at runtime. Every other service — `ingestion`, `rca`, `governance`,
+`feedback`, `read`, `migrate`, and the four Meridian sample-system services — paid for ~270MB of
+ML and k8s dependencies it never used, pushing every image, base or not, to ~1.5GB. Worse, the
+bloat wasn't confined to a `pyproject.toml` line: `common/stores.py` unconditionally imported
+`adapters/__init__.py`, which eagerly imported the trained correlator module, which imported
+`numpy` and `river` at module scope — so even a service that only touched `common.stores` for its
+audit-log adapter pulled in the ML stack transitively, with no explicit import anywhere in that
+service's own code to point at. A per-service dependency split was impossible until that leak was
+closed, because the "boundary" it needed to respect didn't hold even in principle.
+
+**Decision.** Fix the leak, then split the dependency graph and the build to match it:
+
+- **Break the transitive leak.** `common/stores.py`'s adapter wiring no longer eagerly imports the
+  trained/robust correlator at module load. The correlator's own `numpy`/`river` imports move to
+  lazy, function-scope imports inside the adapters that actually construct a trained model — the
+  same lazy-import pattern the codebase already used elsewhere for optional heavy deps. A
+  subprocess-based `test_import_boundary.py` (Task 1) asserts `common.stores` can be imported in a
+  process with no `numpy`/`river` installed, so the boundary is a running test, not a convention.
+- **Split the dependency graph.** `pyproject.toml` moves `numpy`, `scikit-learn`, `river`, and
+  `joblib` into an `ml` extra and the `kubernetes` client into a `k8s` extra; `pyyaml` (previously
+  pulled in transitively) is pinned explicitly in the base dependency set since base no longer
+  guarantees it arrives as a side effect of the ML stack. `uv.lock` is regenerated so both `uv sync
+  --frozen` (base) and `uv sync --frozen --extra ml --extra k8s` (full) resolve from the same lock
+  file with no version drift.
+- **Multi-stage build, targeted per service.** `deploy/Dockerfile` gains a shared `builder-base`
+  stage and two leaves: `base` (`uv sync --frozen --no-dev --no-install-project`, no extras) and
+  `full` (the same, plus `--extra ml --extra k8s`). `deploy/docker-compose.yml`'s service anchor
+  builds `target: base`; only `correlation` and `action` override to `target: full`. Every other
+  service — including `migrate` and the four Meridian services, which inherit the anchor —
+  gets the slim image for free.
+- **Verification gate.** CI's `slim-boundary` job builds a base-only venv and imports all 11
+  base-target services plus `common.stores.make_stores`, asserting none of `numpy`/`scipy`/
+  `sklearn`/`river`/`joblib`/`kubernetes` land in `sys.modules`, plus two grep-lints guarding
+  against a regression (no heavy-dep references in `services/feedback/`; no module-scope
+  sklearn/joblib import in the trained correlator). The `compose-smoke` job builds all 13 images
+  and asserts `migrate` exits 0 and every service's `/ready` (7 core services) or `/health`
+  (5 Meridian/demo-app services) returns 200 — proof the split doesn't just build, it boots.
+
+**Why.** The measured result: base-target images are **619MB**, down from **~1.5GB** (a ~59%,
+~900MB drop), confirmed both by `docker images` after a full `docker compose build` and by a
+runtime check (`python -c "import services.rca.app"` inside the built image, then asserting
+`sklearn`/`kubernetes`/`numpy`/`river`/`joblib` are absent from `sys.modules`). `correlation` and
+`action` stay at ~1.5GB on the `full` target, which is correct — they need the libraries they
+carry. This is the same discipline as [ADR-012](#adr-012--config-switched-adapter-selection-with-test-safe-defaults):
+optional behavior (there, a live vs. test-safe adapter; here, ML/k8s dependencies) stays behind an
+explicit, test-verified boundary rather than an implicit one a future change could silently
+reopen — the difference is ADR-012's boundary is a runtime config switch, while this one is a
+build-time dependency graph, but both are enforced by a test that fails loudly if the boundary is
+crossed rather than a convention that quietly erodes. Fixing the import leak first, rather than
+just splitting `pyproject.toml` and hoping the Dockerfile stages sorted themselves out, was the
+load-bearing step: a dependency split on top of an unfixed transitive leak would have left every
+"slim" image still pulling in the full ML stack at import time, silently defeating the whole
+effort.
+
 ---
 
 ## 4. Cross-cutting concerns

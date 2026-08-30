@@ -1,9 +1,10 @@
-import { LockKey, Prohibit, Scroll, ShieldCheck, UserCheck } from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { LockKey, Scroll, ShieldCheck, UserCheck } from "@phosphor-icons/react";
 import { Bezel, Eyebrow, timeAgo } from "../components/primitives";
-import { loadAudit, loadPlaybooks } from "../data/source";
+import { loadAudit, loadOutcomes, loadPlaybooks } from "../data/source";
 import { useLiveData } from "../hooks/useLiveData";
 import { Reveal as Section } from "../hooks/useReveal";
-import type { AuditRow, Playbook } from "../data/types";
+import type { AuditRow, OutcomeRow, Playbook } from "../data/types";
 
 const gates = [
   {
@@ -26,15 +27,36 @@ const gates = [
   },
 ];
 
-const actorTone: Record<string, string> = {
-  allow: "text-sev-ok",
-  deny: "text-sev-crit",
-  pending: "text-sev-warn",
-};
-
 export function Governance() {
+  const PAGE = 25;
+  const [shown, setShown] = useState(PAGE);
   const { data: audit } = useLiveData(loadAudit, [] as AuditRow[]);
+  const { data: outcomes } = useLiveData(loadOutcomes, [] as OutcomeRow[]);
   const { data: playbooks } = useLiveData(loadPlaybooks, [] as Playbook[]);
+  const auditSorted = [...audit].sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+
+  // Per-gate activity: `blocked` is the precise signal — outcomes whose reason
+  // matches the gate that stopped them. `passed` is the honest total of
+  // remediations that cleared every gate (reason === "healthy"); it is not
+  // attributable to a single gate from this data, so all three gates share it.
+  const gateStats = useMemo(() => {
+    const blockedReasons: Record<string, (r: OutcomeRow["reason"]) => boolean> = {
+      "denied:rbac": (r) => r === "denied:rbac",
+      "refused:not-reversible": (r) => r === "refused:not-reversible",
+      "aborted:timeout": (r) => r === "aborted:rejected" || r === "aborted:timeout",
+    };
+    const passed = outcomes.filter((o) => o.reason === "healthy").length;
+    const stats: Record<string, { passed: number; blocked: number; lastTs: number | null }> = {};
+    for (const g of gates) {
+      const match = blockedReasons[g.reason];
+      const blockedOutcomes = outcomes.filter((o) => match(o.reason));
+      const lastTs = blockedOutcomes.length
+        ? blockedOutcomes.reduce((max, o) => (o.ts > max ? o.ts : max), blockedOutcomes[0].ts)
+        : null;
+      stats[g.reason] = { passed, blocked: blockedOutcomes.length, lastTs };
+    }
+    return stats;
+  }, [outcomes]);
 
   return (
     <div className="space-y-6">
@@ -65,6 +87,15 @@ export function Governance() {
                 </div>
                 <p className="mt-2 text-sm leading-relaxed text-ink-2">{g.body}</p>
                 <div className={`mt-4 font-mono text-2xs ${g.tone}`}>→ {g.reason}</div>
+                <div className="mt-3 flex items-center gap-3 border-t border-black/[0.06] pt-3 font-mono text-2xs text-ink-3">
+                  <span className="text-sev-ok">✓ {gateStats[g.reason]?.passed ?? 0} passed</span>
+                  <span className={g.tone}>✗ {gateStats[g.reason]?.blocked ?? 0} blocked</span>
+                  {gateStats[g.reason]?.lastTs ? (
+                    <span className="ml-auto">last {timeAgo(gateStats[g.reason].lastTs!)}</span>
+                  ) : (
+                    <span className="ml-auto">no activity yet</span>
+                  )}
+                </div>
               </div>
             </div>
           </Section>
@@ -75,12 +106,17 @@ export function Governance() {
         {/* audit log */}
         <Section className="lg:col-span-7">
           <Bezel coreClassName="p-6">
-            <div className="mb-4 flex items-center gap-2">
-              <Scroll size={16} weight="light" className="text-ink-2" />
-              <span className="text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">Immutable audit trail · threaded by correlation_id</span>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <span className="flex items-center gap-2 text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">
+                <Scroll size={16} weight="light" className="text-ink-2" />
+                Immutable audit trail · threaded by correlation_id
+              </span>
+              <span className="font-mono text-2xs text-ink-3">
+                showing {Math.min(shown, auditSorted.length)} of {auditSorted.length}
+              </span>
             </div>
             <div className="space-y-1">
-              {audit.map((a, i) => (
+              {auditSorted.slice(0, shown).map((a, i) => (
                 <div key={i} className="grid grid-cols-[auto_1fr_auto] items-center gap-3 rounded-lg px-2 py-2 font-mono text-2xs transition-colors hover:bg-black/[0.03]">
                   <span className="text-ink-3">{timeAgo(a.ts)}</span>
                   <span className="truncate">
@@ -88,13 +124,18 @@ export function Governance() {
                     <span className="text-ink-3"> {a.action} </span>
                     <span className="text-ink">{a.resource}</span>
                   </span>
-                  <span className={`flex items-center gap-1 ${actorTone[a.decision]}`}>
-                    {a.decision === "deny" && <Prohibit size={11} weight="bold" />}
-                    {a.decision}
-                  </span>
+                  <span className={`${a.decision === "deny" ? "text-sev-crit" : a.decision === "pending" ? "text-sev-warn" : "text-sev-ok"}`}>{a.decision}</span>
                 </div>
               ))}
             </div>
+            {shown < auditSorted.length && (
+              <button onClick={() => setShown((n) => n + PAGE)} className="mt-3 w-full rounded-xl border border-black/[0.08] bg-black/[0.03] py-2 font-mono text-2xs text-ink-2 transition-colors hover:bg-black/[0.05]">
+                Load {Math.min(PAGE, auditSorted.length - shown)} more
+              </button>
+            )}
+            {auditSorted.length === 0 && (
+              <div className="rounded-2xl border border-black/[0.06] p-8 text-center text-ink-3">No audit records yet — decisions appear here as the gate evaluates them.</div>
+            )}
             <div className="mt-3 border-t border-black/[0.06] pt-3 font-mono text-2xs text-ink-3">
               NIST AI RMF · EU AI Act · DORA — every entry is append-only.
             </div>
