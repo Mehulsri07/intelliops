@@ -14,6 +14,7 @@ from common.contracts import (
     AuditRecord,
     EnrichmentContext,
     Playbook,
+    PreflightResult,
     RemediationPlan,
     RemediationTarget,
     RootCauseHypothesis,
@@ -157,3 +158,31 @@ class ExplanationProvider(Protocol):
         context: EnrichmentContext,
         situation: Situation,
     ) -> tuple[str, str]: ...
+
+
+@runtime_checkable
+class Sandbox(Protocol):
+    """Rehearses a remediation plan on an isolated copy and reports a verdict."""
+
+    def rehearse(self, situation: Situation, plan: RemediationPlan) -> PreflightResult: ...
+
+
+@runtime_checkable
+class RunbookAuthor(Protocol):
+    """Drafts a typed Playbook for a gap. Returns None when it cannot (fail-to-
+    nothing) — never raises. The caller forces hitl_mode=HITL and a server id."""
+
+    def draft(
+        self, situation: Situation, hint: str | None = None
+    ) -> tuple[Playbook, str | None] | None: ...
+
+
+@runtime_checkable
+class RunbookSelector(Protocol):
+    """Selects a runbook for a situation by semantic similarity among the
+    registered playbooks. Returns (playbook_id, score) or None. Ranks only
+    existing playbooks — never fabricates an id. Never raises."""
+
+    def select(
+        self, situation: Situation, hypothesis: RootCauseHypothesis, store: PlaybookStore
+    ) -> tuple[str, float] | None: ...

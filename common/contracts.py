@@ -77,9 +77,29 @@ class RootCauseHypothesis(BaseModel):
 
 
 class RemediationStep(BaseModel):
-    action: Literal["restart", "scale", "rollback_deploy", "wait"]
+    action: Literal[
+        "restart",
+        "scale",
+        "rollback_deploy",
+        "wait",
+        "patch_resource_limits",
+        "rollback_to_revision",
+        "patch_probe",
+    ]
     replicas: int | None = None  # for scale: a delta, e.g. +2 / -2
     note: str | None = None  # human-readable / wait annotation
+    # patch_resource_limits: new container resource ceilings (targeted change).
+    cpu_limit: str | None = None  # e.g. "500m"
+    mem_limit: str | None = None  # e.g. "512Mi"
+    container: str | None = None  # which container; None -> first/only
+    # rollback_to_revision: the Deployment revision to roll back to.
+    revision: int | None = None
+    # patch_probe: adjust a liveness/readiness probe's timing.
+    probe: Literal["liveness", "readiness"] | None = None
+    initial_delay_seconds: int | None = None
+    period_seconds: int | None = None
+    timeout_seconds: int | None = None  # probe timeout; NOT the remediation timeout
+    failure_threshold: int | None = None
 
 
 class RemediationTarget(BaseModel):
@@ -93,6 +113,13 @@ class RemediationPlan(BaseModel):
     rollback_steps: list[RemediationStep] = Field(default_factory=list)
 
 
+class PreflightResult(BaseModel):
+    passed: bool
+    detail: str  # e.g. "sandbox: pod healthy in 8s" / "not rehearsed (sandbox off)"
+    mode: str  # "off" | "k8s"
+    sandbox_namespace: str | None = None  # the throwaway ns, for audit
+
+
 class Playbook(BaseModel):
     id: str
     name: str
@@ -101,6 +128,24 @@ class Playbook(BaseModel):
     hitl_mode: HitlMode
     reversible: bool = False
     rollback_steps: list[RemediationStep] = Field(default_factory=list)
+    symptoms: str | None = None  # human-written "when this applies" — the semantic match target
+
+
+class ProposedPlaybookStatus(str, Enum):
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ProposedPlaybook(BaseModel):
+    id: str  # server-assigned
+    playbook: Playbook  # the typed draft — steps validate via the closed Literal
+    status: ProposedPlaybookStatus = ProposedPlaybookStatus.PROPOSED
+    proposed_by: str
+    rationale: str | None = None
+    source_situation_id: str | None = None
+    decided_by: str | None = None
+    ts: datetime
 
 
 class ApprovalRequest(BaseModel):
@@ -110,6 +155,7 @@ class ApprovalRequest(BaseModel):
     requested_by: str
     status: str = "pending"
     decided_by: str | None = None
+    preflight: PreflightResult | None = None
 
 
 class RemediationOutcome(BaseModel):
@@ -121,6 +167,7 @@ class RemediationOutcome(BaseModel):
     hitl_mode: HitlMode = HitlMode.HITL
     steps: list[str] = Field(default_factory=list)
     mode: str = "dry_run"  # "dry_run" | "k8s"
+    preflight: PreflightResult | None = None
 
 
 class AuditRecord(BaseModel):

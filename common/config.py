@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # --- K8s remediation settings (test-safe defaults) ---
     remediator_mode: str = "dry_run"  # "dry_run" | "k8s"
     health_check_mode: str = "always"  # "always" | "k8s"
+    sandbox_mode: str = "off"  # "off" | "k8s"
     k8s_namespace: str = "intelliops-demo"
     meridian_ops_target_mode: str = "compose"  # "compose" | "k8s"
     store_backend: str = "file"  # "file" | "postgres"
@@ -70,6 +71,18 @@ class Settings(BaseSettings):
     llm_explanation_model: str = "gpt-4o-mini"
     llm_explanation_timeout_seconds: float = 10.0
     llm_explanation_api_key: str = ""
+
+    # --- AI-authored runbooks (off by default; LLM opt-in via endpoint) ---
+    runbook_author_mode: str = "off"  # "off" | "openai"
+    llm_runbook_endpoint: str = ""  # empty = NullRunbookAuthor, no network
+    llm_runbook_model: str = "gpt-4o-mini"
+    llm_runbook_timeout_seconds: float = 10.0
+    llm_runbook_api_key: str = ""
+
+    # --- Semantic runbook selection (off by default; keyword matching unaffected) ---
+    runbook_selector_mode: str = "off"  # "off" | "embedding"
+    runbook_selector_model: str = "all-MiniLM-L6-v2"
+    runbook_selector_threshold: float = 0.45  # min cosine similarity to accept a match
 
 
 @lru_cache

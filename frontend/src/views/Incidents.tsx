@@ -13,7 +13,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { Bezel, Eyebrow, SevChip, StatusChip, timeAgo, motion as m } from "../components/primitives";
-import { loadSituations, loadSituationDetail, decideApproval, loadMetrics, loadOutcomes } from "../data/source";
+import { loadSituations, loadSituationDetail, decideApproval, loadMetrics, loadOutcomes, proposePlaybook } from "../data/source";
 import { useLiveData } from "../hooks/useLiveData";
 import { pushToast } from "../hooks/useToast";
 import type { Situation, SituationStatus, Metrics, OutcomeRow } from "../data/types";
@@ -87,6 +87,7 @@ export function Incidents() {
   const [overrides, setOverrides] = useState<Record<string, Partial<Situation>>>({});
   const [selId, setSelId] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  const [proposing, setProposing] = useState(false);
 
   // merge server data with local optimistic overrides, but let server truth win:
   // once the server shows a terminal status, the optimistic override is stale.
@@ -155,7 +156,13 @@ export function Incidents() {
           () =>
             update(sel.id, {
               status: "resolved",
-              outcome: { result: "success", health_after: "healthy", mode: "dry_run", steps: [] },
+              outcome: {
+                result: "success",
+                health_after: "healthy",
+                mode: "dry_run",
+                steps: [],
+                preflight: { passed: true, detail: "sandbox: clone healthy in 8s", mode: "k8s" },
+              },
             }),
           1400,
         );
@@ -166,6 +173,19 @@ export function Incidents() {
       update(sel.id, { status: "diagnosed" }); // roll the optimistic flip back
     } finally {
       setWorking(false);
+    }
+  }
+
+  async function draftWithAI() {
+    if (proposing || !sel) return;
+    setProposing(true);
+    try {
+      await proposePlaybook(sel, "oncall-alice");
+      pushToast("success", "Draft created — review in Governance");
+    } catch (e) {
+      pushToast("error", `Draft failed: ${e instanceof Error ? e.message : "unknown"}`);
+    } finally {
+      setProposing(false);
     }
   }
 
@@ -383,6 +403,16 @@ export function Incidents() {
                         {shown.outcome?.steps && shown.outcome.steps.length > 0 && (
                           <div className="mt-1 font-mono text-2xs text-ink-3">steps: {shown.outcome.steps.join(" → ")}</div>
                         )}
+                        {shown.outcome?.preflight && shown.outcome.preflight.mode !== "off" && (
+                          <div className="mt-1 font-mono text-2xs text-ink-3">
+                            🧪 pre-flight:{" "}
+                            {shown.outcome.preflight.passed ? (
+                              <span className="text-sev-ok">rehearsed in sandbox — passed</span>
+                            ) : (
+                              <span className="text-sev-warn">failed — {shown.outcome.preflight.detail}</span>
+                            )}
+                          </div>
+                        )}
                         <div className="font-mono text-2xs text-ink-3">outcome labeled → reliability rising → next matching storm may be suppressed</div>
                       </div>
                     </div>
@@ -393,6 +423,16 @@ export function Incidents() {
                         <div className="text-sm font-medium text-ink">
                           No action taken · <span className="font-mono text-sev-warn">{shown.outcome?.health_after ?? "aborted"}</span>
                         </div>
+                        {shown.outcome?.preflight && shown.outcome.preflight.mode !== "off" && (
+                          <div className="mt-1 font-mono text-2xs text-ink-3">
+                            🧪 pre-flight:{" "}
+                            {shown.outcome.preflight.passed ? (
+                              <span className="text-sev-ok">rehearsed in sandbox — passed</span>
+                            ) : (
+                              <span className="text-sev-warn">failed — {shown.outcome.preflight.detail}</span>
+                            )}
+                          </div>
+                        )}
                         <div className="font-mono text-2xs text-ink-3">gate failed closed — nothing executed</div>
                       </div>
                     </div>
@@ -402,6 +442,28 @@ export function Incidents() {
                       <div>
                         <div className="text-sm font-medium text-ink">Auto-remediating · <span className="font-mono text-signal">{shown.suggested_runbook_id}</span></div>
                         <div className="font-mono text-2xs text-ink-3">graduated playbook — RBAC-checked, running without a human</div>
+                      </div>
+                    </div>
+                  ) : !shown.suggested_runbook_id ? (
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-2 w-2 rounded-full bg-ink-4" />
+                        <span className="text-sm font-medium text-ink">No matching playbook</span>
+                      </div>
+                      <p className="mt-1.5 font-mono text-2xs text-ink-3">
+                        RCA found no runbook that matches this situation. A human can draft one with AI —
+                        the draft is stored as a proposal, never registered automatically; it only reaches
+                        the live registry if a human approves it in Governance.
+                      </p>
+                      <div className="mt-3 flex gap-2">
+                        <button
+                          onClick={draftWithAI}
+                          disabled={proposing}
+                          className="group flex items-center gap-2 rounded-full bg-signal px-5 py-2.5 text-sm font-medium text-white transition-all duration-300 ease-fluid active:scale-[0.97] disabled:opacity-50"
+                        >
+                          {proposing ? <CircleNotch size={15} weight="bold" className="animate-spin" /> : <Sparkle size={15} weight="light" />}
+                          {proposing ? "Drafting…" : "Draft a runbook with AI"}
+                        </button>
                       </div>
                     </div>
                   ) : (
