@@ -28,6 +28,7 @@ from common.contracts import (
     ProposedPlaybookStatus,
     Situation,
 )
+from common.idempotency import make_guard
 from common.stores import make_stores
 from services.base import create_app, db_ready
 from services.governance.adapters.author_tools import AuthorToolbox
@@ -121,7 +122,12 @@ async def lifespan(app: FastAPI):
     stop_event = threading.Event()
     thread = threading.Thread(
         target=run_consumer,
-        args=(app.state.bus, app.state.author_decision_store, stop_event),
+        args=(
+            app.state.bus,
+            app.state.author_decision_store,
+            stop_event,
+            make_guard(get_settings(), app.state.bus),
+        ),
         daemon=True,
     )
     thread.start()
@@ -158,8 +164,30 @@ class Graduate(BaseModel):
     decided_by: str
 
 
+class DraftSituation(BaseModel):
+    """What drafting a runbook actually needs from a situation.
+
+    This used to be the full `Situation` contract, which made the endpoint
+    unusable from the console: it posts the READ PROJECTION, which is not a
+    Situation and never was. The projection carries first_seen as epoch
+    milliseconds, drops `source`/`fingerprint` from member_events, and reports
+    display statuses like "needs_attention" that are deliberately not in the
+    SituationStatus enum (ADR-032). Every one of those is a 422 - so clicking
+    "Draft a runbook with AI", which is only ever offered ON a needs_attention
+    incident, could not succeed.
+
+    The author only ever reads id, severity and signature (see runbook_author's
+    prompt construction), so the request now asks for exactly that. Extra keys
+    the console happens to send are ignored rather than rejected.
+    """
+
+    id: str
+    signature: str
+    severity: str
+
+
 class ProposeRequest(BaseModel):
-    situation: Situation
+    situation: DraftSituation
     hint: str | None = None
     requested_by: str
 

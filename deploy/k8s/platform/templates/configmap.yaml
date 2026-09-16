@@ -14,8 +14,19 @@ data:
   INTELLIOPS_AUTH_MODE: {{ .Values.env.AUTH_MODE | quote }}
   INTELLIOPS_STORE_BACKEND: {{ .Values.env.STORE_BACKEND | quote }}
   INTELLIOPS_BUS_BACKEND: {{ .Values.env.BUS_BACKEND | quote }}
+  # Delivery durability (issue #53) + read-model cold start (#58). All default to
+  # the historical behaviour; flip them together for an at-least-once posture.
+  INTELLIOPS_BUS_DELIVERY: {{ .Values.env.BUS_DELIVERY | quote }}
+  INTELLIOPS_BUS_DLQ_MODE: {{ .Values.env.BUS_DLQ_MODE | quote }}
+  INTELLIOPS_BUS_IDEMPOTENCY_MODE: {{ .Values.env.BUS_IDEMPOTENCY_MODE | quote }}
+  INTELLIOPS_READ_REBUILD_MODE: {{ .Values.env.READ_REBUILD_MODE | quote }}
+  INTELLIOPS_CORRELATION_GROUP_BY: {{ .Values.env.CORRELATION_GROUP_BY | quote }}
   # The Redis Service is named plainly (see redis.yaml), NOT <release>-prefixed.
   INTELLIOPS_REDIS_URL: {{ printf "redis://redis:6379/0" | quote }}
+  # read-service asks the service that OWNS each setting for /system rather than
+  # reporting its own env as fact. Without these it falls back to local values and
+  # honestly labels them unverified - correct, but unverified.
+  INTELLIOPS_RCA_URL: {{ printf "http://rca:8000" | quote }}
   # INTELLIOPS_DATABASE_URL is NOT here — it embeds the DB password, so it lives
   # in the `postgres-credentials` Secret and reaches services via envFrom:secretRef
   # (issue #57). (It uses the psycopg v3 driver + the plain `postgres` Service host.)
@@ -43,6 +54,10 @@ data:
   # How long the action service waits for a human HITL decision before aborting.
   # The default 30s is too short to click Approve in the UI live — raised in values-live.
   INTELLIOPS_HITL_POLL_TIMEOUT_SECONDS: {{ .Values.env.HITL_POLL_TIMEOUT_SECONDS | quote }}
+  # Post-remediation verification deadline. MUST exceed the target's
+  # terminationGracePeriodSeconds or a successful fix is reported as a
+  # rollback (the old pod still counts toward status.replicas).
+  INTELLIOPS_HEALTH_CHECK_TIMEOUT_SECONDS: {{ .Values.env.HEALTH_CHECK_TIMEOUT_SECONDS | quote }}
   # LLM explainer endpoint/model (non-secret). The API KEY is NOT here — it is
   # injected on the rca pod via a Secret (secretKeyRef), never the configmap.
   INTELLIOPS_LLM_EXPLANATION_ENDPOINT: {{ .Values.env.LLM_EXPLANATION_ENDPOINT | quote }}

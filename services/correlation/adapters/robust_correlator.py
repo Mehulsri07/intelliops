@@ -28,6 +28,13 @@ from services.correlation.adapters.base_correlator import BaseCorrelator
 from services.correlation.detection_policy import DetectionPolicy
 
 _MAD_C = 1.4826  # MAD -> sigma consistency constant for normal data
+# Relative tolerance for calling a zero-MAD window 'unchanged' - float noise
+# and a re-published identical value must not read as an anomaly.
+_FLAT_TOLERANCE = 1e-9
+# Floor for a step off a perfectly flat baseline. Comfortably above the
+# default z_threshold (3.0) so such a step is always caught; the actual score
+# rises with the relative size of the jump.
+_FLAT_STEP_SCORE = 6.0
 
 
 class RobustCorrelator(BaseCorrelator):
@@ -59,7 +66,27 @@ class RobustCorrelator(BaseCorrelator):
             arr = np.fromiter(win, dtype=float, count=len(win))
             med = np.median(arr)
             mad = np.median(np.abs(arr - med))
-            score = 0.0 if mad == 0.0 else abs(event.value - med) / (_MAD_C * mad)
+            deviation = abs(event.value - med)
+            if mad > 0.0:
+                score = deviation / (_MAD_C * mad)
+            elif deviation <= _FLAT_TOLERANCE * max(abs(med), 1.0):
+                # Perfectly flat baseline and the value has not moved: normal.
+                score = 0.0
+            else:
+                # MAD == 0 means every sample in the window is identical, so ANY
+                # real movement is unprecedented by definition. Returning 0.0 here
+                # (the previous behaviour) made this correlator permanently blind
+                # to a step on a flat series: a metric pinned at 0.4 that jumps to
+                # 46.4 scored 0.00 forever, while RiverCorrelator scored 10.91.
+                # Verified against the real tls_handshake_failures series, whose
+                # baseline is exactly constant - so the escalation path could
+                # never fire under `robust`.
+                #
+                # There is no sample spread to scale by, so the magnitude is
+                # expressed relative to the baseline itself and floored at the
+                # threshold: this is an anomaly, and how large it is is a matter
+                # of degree, not of whether.
+                score = max(_FLAT_STEP_SCORE, deviation / max(abs(med), 1.0))
         win.append(event.value)  # score-before-fold (matches RiverCorrelator ordering)
         return float(score)
 
@@ -76,6 +103,37 @@ class RobustCorrelator(BaseCorrelator):
             last_seen=max(e.ts for e in events),
             signature=signature,
         )
+
+    def baseline_snapshot(self) -> dict:
+        """Per-metric {name: {mean, std}} for attaching to an emitted Situation.
+
+        Post-remediation verification (services/action/verify.py) asks whether a
+        firing metric has returned to its baseline, and looks it up BY METRIC
+        NAME. Without this method the engine attached no baseline at all under
+        CORRELATOR_KIND=robust and every score-only metric was unverifiable, so
+        a successful fix was always reported as a rollback.
+
+        Samples are pooled across the seasonal hour buckets: the verifier has no
+        bucket context, and a metric-level baseline is the stable thing to
+        compare a just-recovered value against. The estimators match detect()'s
+        (median / MAD -> sigma), so verification agrees with the detection that
+        produced the situation.
+        """
+        pooled: dict[str, list[float]] = {}
+        for (name, _bucket), win in list(self._windows.items()):  # list() = live-resize guard
+            if win:
+                pooled.setdefault(name, []).extend(win)
+
+        out: dict = {}
+        for name, samples in pooled.items():
+            arr = np.fromiter(samples, dtype=float, count=len(samples))
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            # std 0.0 is a real, meaningful answer here: the metric never moved.
+            # service_up is exactly that, and verify.py treats it as the
+            # strongest possible baseline rather than a missing one.
+            out[name] = {"mean": med, "std": mad * _MAD_C}
+        return out
 
     def snapshot(self) -> list[dict]:
         out: list[dict] = []

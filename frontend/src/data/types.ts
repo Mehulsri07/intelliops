@@ -9,11 +9,14 @@ export type SituationStatus =
   | "acting"
   | "resolved"
   | "failed"
+  // terminal, but NOT a failure: nothing was executed because there was no
+  // candidate fix — a human has to look.
+  | "needs_attention"
   | "suppressed";
 
 export type HitlMode = "auto" | "hitl" | "disabled";
 
-export type RemediationResult = "success" | "failure" | "rolled_back";
+export type RemediationResult = "success" | "failure" | "rolled_back" | "escalated";
 
 /** The exact health_after vocabulary the action service emits. */
 export type OutcomeReason =
@@ -25,7 +28,9 @@ export type OutcomeReason =
   | "aborted:rejected"
   | "aborted:timeout"
   | "skipped:disabled"
-  | "skipped:no-playbook";
+  | "skipped:no-playbook"
+  | "escalated:no-diagnosis"
+  | "escalated:unknown-runbook";
 
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -42,7 +47,8 @@ export interface Hypothesis {
 export interface SituationOutcome {
   result: RemediationResult;
   health_after: OutcomeReason;
-  mode: "dry_run" | "k8s";
+  // "none" is the escalation case — no executor ran at all.
+  mode: "dry_run" | "k8s" | "none";
   steps: string[];
   preflight?: {
     passed: boolean;
@@ -71,7 +77,9 @@ export interface Situation {
   peak_score?: number | null;
   baseline?: Record<string, { mean: number; std: number }> | null;
   member_events?: MemberEvent[];
-  stages?: Partial<Record<"detected" | "diagnosed" | "acting" | "resolved" | "failed", number>>;
+  stages?: Partial<
+    Record<"detected" | "diagnosed" | "acting" | "resolved" | "failed" | "needs_attention", number>
+  >;
 }
 
 export interface OutcomeRow {
@@ -87,7 +95,7 @@ export interface AuditRow {
   actor: string;
   action: string;
   resource: string;
-  decision: "allow" | "deny" | "pending";
+  decision: "allow" | "deny" | "pending" | "escalated";
   ts: number;
   correlation_id: string;
 }
@@ -97,11 +105,18 @@ export interface Playbook {
   name: string;
   hitl_mode: HitlMode;
   reversible: boolean;
-  successes: number;
-  rollbacks: number;
-  failures: number;
-  graduated: boolean;
+  symptoms?: string | null;
+  // GET /playbooks does not serve a track record. These were declared required,
+  // so every consumer read `undefined` and rendered 0 forever - the "graduated
+  // playbooks" tile contradicted the copy directly above it. Optional now, and
+  // graduation is derived from hitl_mode instead (see isGraduated).
+  successes?: number;
+  rollbacks?: number;
+  failures?: number;
 }
+
+/** Graduation IS hitl -> auto, and hitl_mode is served, so this needs no new API. */
+export const isGraduated = (p: Playbook): boolean => p.hitl_mode === "auto";
 
 export interface ServiceHealth {
   name: string;
@@ -120,6 +135,7 @@ export interface Metrics {
   suppressedToday: number;
   approvalsPending: number;
   successRate: number; // 0..1
+  needsAttention: number; // escalations awaiting a human — excluded from successRate
 }
 
 export interface MemberEvent {
@@ -235,4 +251,22 @@ export interface RunSummary {
   signature: string;
   step_count: number;
   proposal_id?: string | null;
+}
+
+/** A real time-series from GET /metrics/history (Prometheus, proxied by read). */
+export interface MetricSeries {
+  service: string;
+  /** [unix_seconds, value] pairs, oldest first. */
+  points: [number, number][];
+}
+
+export interface MetricHistory {
+  metric: string;
+  /** false when Prometheus could not be reached - render "no data", never a fake shape. */
+  available: boolean;
+  reason?: string;
+  start: number;
+  end: number;
+  step_seconds: number;
+  series: MetricSeries[];
 }

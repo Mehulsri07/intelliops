@@ -55,7 +55,11 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.bus = make_bus(settings)
+    # The consumer name MUST stay stable across restarts: under at-least-once the
+    # pending-entry self-drain re-serves entries recorded against THIS name, so a
+    # per-process name would strand an un-acked entry. Scaling a consumer past
+    # replicas:1 needs per-pod names plus XAUTOCLAIM (see ADR-033).
+    app.state.bus = make_bus(settings, consumer_name=settings.bus_consumer_name or "c1")
 
     _is_exempt = auth_exempt or (lambda method, path: path in ("/health", "/ready"))
 
@@ -77,6 +81,36 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"service": service_name, "status": "ok"}
+
+    @app.get("/config/posture")
+    def posture() -> dict:
+        """What THIS process is actually running.
+
+        /system on read-service aggregates the operational posture, but those
+        settings belong to other services - correlator_kind to correlation,
+        remediator_mode to action, store_backend to whoever owns a store. Read
+        was answering from its OWN environment, which is not merely stale but
+        a different process's configuration: it reported store_backend "file"
+        while five services ran on Postgres. Each service now answers for
+        itself and read asks the owner.
+
+        Deliberately no secrets: endpoints and modes only, never a key.
+        """
+        s = get_settings()
+        return {
+            "service": service_name,
+            "store_backend": s.store_backend,
+            "bus_backend": s.bus_backend,
+            "auth_mode": s.auth_mode,
+            "correlator_kind": s.correlator_kind,
+            "detection_policy": s.detection_policy,
+            "remediator_mode": s.remediator_mode,
+            "health_check_mode": s.health_check_mode,
+            "sandbox_mode": s.sandbox_mode,
+            "runbook_selector_mode": s.runbook_selector_mode,
+            "bus_delivery": s.bus_delivery,
+            "correlation_group_by": s.correlation_group_by,
+        }
 
     @app.get("/ready")
     def ready():

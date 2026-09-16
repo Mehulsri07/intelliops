@@ -20,10 +20,15 @@ from common.contracts import (
     SituationStatus,
 )
 
+# The projection's own status vocabulary: a deliberate superset of the backend
+# SituationStatus enum, because the console needs a card colour for outcomes the
+# backend state machine has no state for. Any RemediationResult missing here
+# silently falls back to "failed" in apply_outcome, so a new member MUST be added.
 _RESULT_STATUS = {
     RemediationResult.SUCCESS: "resolved",
     RemediationResult.FAILURE: "failed",
     RemediationResult.ROLLED_BACK: "failed",
+    RemediationResult.ESCALATED: "needs_attention",
 }
 
 _SEVERITY_MAP = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}
@@ -119,6 +124,10 @@ class ReadModel:
             "peak_score": s.peak_score,
             "baseline": s.baseline,
             "first_seen": _epoch_ms(s.first_seen),
+            # Required by the Situation contract. The console posts a situation
+            # back to governance for AI drafting, and without this that request
+            # is rejected 422 - the projection was not round-trippable.
+            "last_seen": _epoch_ms(s.last_seen),
             "hypotheses": existing.get("hypotheses", []),
             "suggested_runbook_id": existing.get("suggested_runbook_id"),
             "hitl_mode": existing.get("hitl_mode", "hitl"),
@@ -202,6 +211,12 @@ class ReadModel:
                 "hitl_mode": o.hitl_mode.value
                 if hasattr(o.hitl_mode, "value")
                 else str(o.hitl_mode),
+                # Whether a real cluster was touched. The nested per-situation
+                # outcome already carried this, but the flat /outcomes feed - the
+                # one the console's history renders - dropped it, so "we really
+                # restarted a pod" and "we simulated it" were indistinguishable
+                # downstream. It is the whole point of the k8s posture.
+                "mode": getattr(o, "mode", "dry_run"),
                 "mttr_ms": mttr_ms,
             },
         )
@@ -209,6 +224,12 @@ class ReadModel:
         self.publish({"type": "changed"})
 
     _TERMINAL: ClassVar[set[str]] = {"resolved", "failed"}
+
+    # "needs_attention" is deliberately NOT terminal — the one incident that most
+    # needs a human must never vanish from the console on a TTL. It is still
+    # evictable, otherwise a fault storm matching no playbook would grow _sits
+    # past max_situations without bound.
+    _EVICTABLE: ClassVar[set[str]] = {"resolved", "failed", "needs_attention"}
 
     def _age_out(self, now_ms: int) -> None:
         # age-out terminal situations older than ttl (needs a clock)
@@ -220,13 +241,15 @@ class ReadModel:
     def _enforce_cap(self) -> None:
         # cap: if over max, evict oldest-terminal-first (never active). Pure
         # relative ordering by stored last_activity, so no clock is needed.
+        # needs_attention sorts last so it is only sacrificed once no genuinely
+        # finished situation is left to drop.
         if len(self._sits) > self._max_sits:
-            terminal = sorted(
-                (s for s in self._sits.values() if s["status"] in self._TERMINAL),
-                key=lambda s: s.get("last_activity", 0),
+            evictable = sorted(
+                (s for s in self._sits.values() if s["status"] in self._EVICTABLE),
+                key=lambda s: (s["status"] == "needs_attention", s.get("last_activity", 0)),
             )
             n_to_drop = len(self._sits) - self._max_sits
-            for s in terminal[:n_to_drop]:
+            for s in evictable[:n_to_drop]:
                 del self._sits[s["id"]]
 
     def _prune(self, now_ms: int) -> None:
@@ -252,14 +275,25 @@ class ReadModel:
         self._outcomes.clear()
         self._suppressed_count = 0
 
-    _OPEN: ClassVar[set[str]] = {"detected", "diagnosed", "acting"}
+    # needs_attention is outstanding work, so it counts as open even though it is
+    # not in-flight. approvalsPending narrows to diagnosed/acting on its own.
+    _OPEN: ClassVar[set[str]] = {"detected", "diagnosed", "acting", "needs_attention"}
 
     def metrics(self) -> dict:
+        # Enforce the same cap situations() does. Without this the two endpoints
+        # count different sets, and the console renders them side by side: the
+        # noise-reduction tile said "N alerts -> 3 open" while the incident list
+        # directly beneath it showed 2. Same projection, two answers.
+        self._enforce_cap()
         sits = list(self._sits.values())
         outs = self._outcomes
-        total_out = len(outs)
-        successes = sum(1 for o in outs if o["result"] == "success")
-        autos = sum(1 for o in outs if o.get("hitl_mode") == "auto")
+        # Escalations are "we never tried", so they belong in neither the numerator
+        # nor the denominator of a remediation rate — counting them as attempts
+        # would penalise the system for correctly refusing to guess.
+        attempted = [o for o in outs if o["result"] != "escalated"]
+        n_att = len(attempted)
+        successes = sum(1 for o in attempted if o["result"] == "success")
+        autos = sum(1 for o in attempted if o.get("hitl_mode") == "auto")
         mttrs = [o["mttr_ms"] for o in outs if o.get("mttr_ms") is not None]
         alerts = sum(s["memberCount"] for s in sits)
         n_sits = len(sits)
@@ -275,10 +309,11 @@ class ReadModel:
             "situationsOpen": len(open_sits),
             "noiseReductionPct": round(max(0.0, noise), 1),
             "mttrMinutes": round((sum(mttrs) / len(mttrs) / 60000), 2) if mttrs else 0.0,
-            "autoRemediatedPct": round(autos / total_out * 100, 1) if total_out else 0.0,
+            "autoRemediatedPct": round(autos / n_att * 100, 1) if n_att else 0.0,
             "suppressedToday": self._suppressed_count,
             "approvalsPending": len(pending),
-            "successRate": round(successes / total_out, 3) if total_out else 0.0,
+            "successRate": round(successes / n_att, 3) if n_att else 0.0,
+            "needsAttention": sum(1 for s in sits if s["status"] == "needs_attention"),
         }
 
     @staticmethod

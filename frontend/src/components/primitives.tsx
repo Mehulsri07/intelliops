@@ -111,6 +111,7 @@ const statusLabel: Record<SituationStatus, string> = {
   acting: "Remediating",
   resolved: "Resolved",
   failed: "Failed",
+  needs_attention: "Needs Attention",
   suppressed: "Suppressed",
 };
 const statusSkin: Record<SituationStatus, string> = {
@@ -119,6 +120,9 @@ const statusSkin: Record<SituationStatus, string> = {
   acting: "text-sev-warn bg-sev-warn/10",
   resolved: "text-sev-ok bg-sev-ok/10",
   failed: "text-sev-crit bg-sev-crit/10",
+  // Its own tone plus a ring the other chips don't carry — an escalation must
+  // never be mistaken for `acting` (in flight) or `failed` (the fix broke).
+  needs_attention: "text-sev-attention bg-sev-attention/10 ring-1 ring-inset ring-sev-attention/35",
   suppressed: "text-signal bg-signal/10",
 };
 export function StatusChip({ status }: { status: SituationStatus }) {
@@ -143,6 +147,9 @@ export function Sparkline({
   height?: number;
   width?: number;
 }) {
+  // An empty or single-point series used to throw (data[length-1] on []) or
+  // emit NaN coordinates. Render nothing rather than a broken path.
+  if (!data || data.length < 2) return null;
   const max = Math.max(...data);
   const min = Math.min(...data);
   const span = max - min || 1;

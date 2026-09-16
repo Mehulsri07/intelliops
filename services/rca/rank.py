@@ -65,6 +65,22 @@ def rank_hypotheses(
 
     names = " ".join(e.name.lower() for e in situation.member_events)
 
+    # Rule: the service is down (service_up flipped to 0). Unambiguous and
+    # ranked above every capacity rule (0.7) — a process that is not serving is
+    # recycled, not scaled; new replicas of a wedged image are still wedged.
+    # Ranked below the deploy rule (0.8): if a deploy preceded it, the deploy is
+    # the better explanation and rolling back beats restarting.
+    if "service_up" in names:
+        hypotheses.append(
+            RootCauseHypothesis(
+                situation_id=situation.id,
+                description="service is down — the process stopped serving",
+                confidence=0.7,
+                evidence=[f"metrics: {names}"],
+                suggested_runbook_id="restart-pod",
+            )
+        )
+
     # Rule: memory pressure/leak. Ranked ABOVE saturation (0.65 > 0.6) so a
     # memory-leaking service is restarted, not scaled — new pods spun up by
     # scale-service leak too, so restart is the right fix here, not capacity.
@@ -93,7 +109,11 @@ def rank_hypotheses(
 
     # Rule: latency/queueing/request-surge metric names — points to capacity
     # contention, not a wedged process, so scale rather than restart.
-    if any(tok in names for tok in ("latency", "queue_depth", "request_rate")):
+    # "duration" is OpenTelemetry's word for what Meridian calls "latency"
+    # (OTel semantic conventions: http.server.request.duration,
+    # rpc.server.duration). Without it every OTel-sourced latency incident would
+    # match no rule and escalate, which is technically honest but useless.
+    if any(tok in names for tok in ("latency", "duration", "queue_depth", "request_rate")):
         hypotheses.append(
             RootCauseHypothesis(
                 situation_id=situation.id,

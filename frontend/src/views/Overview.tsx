@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowsClockwise,
   Broadcast,
@@ -6,6 +6,7 @@ import {
   Circuitry,
   Cpu,
   Gauge,
+  HandPalm,
   Lightning,
   MagicWand,
   Pulse,
@@ -33,18 +34,41 @@ import {
   loadProposals,
   loadSituations,
   loadSystem,
+  loadMetricHistory,
 } from "../data/source";
-import { series } from "../data/mock";
 import { system as mockSystem } from "../data/mock";
+import { LiveChart } from "../components/LiveChart";
+import { isGraduated } from "../data/types";
 import type {
+  MetricHistory,
   Metrics,
   OutcomeRow,
+  RemediationResult,
   Playbook,
   ProposedPlaybook,
   Situation,
   SystemInfo,
 } from "../data/types";
 import type { View } from "../components/Shell";
+
+// Metric families Meridian exposes and Prometheus actually scrapes.
+const METRIC_CHOICES = [
+  { key: "cpu_usage", label: "cpu", unit: "%" },
+  { key: "memory_usage_mb", label: "memory", unit: "MB" },
+  { key: "latency_p99_ms", label: "p99", unit: "ms" },
+  { key: "meridian_error_rate", label: "errors", unit: "" },
+  { key: "queue_depth", label: "queue", unit: "" },
+  { key: "service_up", label: "up", unit: "" },
+];
+
+const EMPTY_HISTORY: MetricHistory = {
+  metric: "cpu_usage",
+  available: false,
+  start: 0,
+  end: 0,
+  step_seconds: 0,
+  series: [],
+};
 
 /* ---------------------------------------------------------------------------
    Count-up — eases a number to its target once, respecting reduced-motion.
@@ -95,7 +119,7 @@ function Kpi({
   value: number;
   suffix?: string;
   sub: string;
-  spark: number[];
+  spark?: number[];
   color?: string;
   decimals?: number;
 }) {
@@ -113,9 +137,11 @@ function Kpi({
         {suffix && <span className="pb-1 text-lg font-medium text-ink-3">{suffix}</span>}
       </div>
       <div className="mt-0.5 font-mono text-2xs text-ink-3">{sub}</div>
-      <div className="mt-3 -mb-1">
-        <Sparkline data={spark} color={color} width={220} height={40} />
-      </div>
+      {spark && spark.length > 1 && (
+        <div className="mt-3 -mb-1">
+          <Sparkline data={spark} color={color} width={220} height={40} />
+        </div>
+      )}
     </Bezel>
   );
 }
@@ -137,6 +163,10 @@ const outcomeSkin: Record<string, { tone: string; icon: JSX.Element; label: stri
   success: { tone: "text-sev-ok bg-sev-ok/10 border-sev-ok/25", icon: <CheckCircle size={12} weight="fill" />, label: "success" },
   rolled_back: { tone: "text-sev-warn bg-sev-warn/10 border-sev-warn/25", icon: <ArrowsClockwise size={12} weight="bold" />, label: "rolled back" },
   failure: { tone: "text-sev-crit bg-sev-crit/10 border-sev-crit/25", icon: <XCircle size={12} weight="fill" />, label: "failure" },
+  // Typed Record<string, ...> and read with a `?? outcomeSkin.failure` fallback, so a missing
+  // entry here is invisible to tsc and would paint every escalation red — the exact operator
+  // misread this state exists to prevent.
+  escalated: { tone: "text-sev-attention bg-sev-attention/10 border-sev-attention/25", icon: <HandPalm size={12} weight="fill" />, label: "escalated" },
 };
 
 /** Honest AI-explainer posture, derived only from server-reported system.llm. */
@@ -153,7 +183,7 @@ function aiExplainerState(llm: SystemInfo["llm"]) {
 export function Overview({ onView }: { onView: (v: View) => void }) {
   const { data: metrics } = useLiveData(loadMetrics, {
     alertsIngested: 0, situationsOpen: 0, noiseReductionPct: 0, mttrMinutes: 0,
-    autoRemediatedPct: 0, suppressedToday: 0, approvalsPending: 0, successRate: 0,
+    autoRemediatedPct: 0, suppressedToday: 0, approvalsPending: 0, successRate: 0, needsAttention: 0,
   } as Metrics);
   const { data: sits } = useLiveData(loadSituations, [] as Situation[]);
   const { data: outcomes } = useLiveData(loadOutcomes, [] as OutcomeRow[]);
@@ -161,31 +191,32 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
   const { data: proposals } = useData(loadProposals, [] as ProposedPlaybook[]);
   const { data: sys } = useLiveData(loadSystem, mockSystem);
 
-  // sparkline series are deterministic (seeded) so they don't jitter each poll.
-  const sparks = useMemo(
-    () => ({
-      noise: series(24, 60, 1.3, 3),
-      mttr: series(24, 14, -0.35, 11),
-      auto: series(24, 22, 0.7, 5),
-      success: series(24, 82, 0.5, 9),
-    }),
-    [],
-  );
+  // The KPI sparklines used to be seeded pseudo-random arrays from the mock
+  // module, memoised with [] - a fabricated curve, identical every session, drawn
+  // next to real numbers in live mode. There is no per-KPI history endpoint, so
+  // rather than invent one they are gone: the real chart below carries the trend.
+
+  const [metric, setMetric] = useState<string>("cpu_usage");
+  const historyLoader = useCallback(() => loadMetricHistory(metric, 15), [metric]);
+  const { data: history } = useLiveData(historyLoader, EMPTY_HISTORY);
 
   const open = useMemo(
-    () => sits.filter((s) => !["resolved", "suppressed"].includes(s.status)),
+    // Mirrors read/projection.py _OPEN exactly. The old list excluded a
+    // "suppressed" status the backend never emits and counted "failed" as open,
+    // so this number disagreed with the one /metrics reported beside it.
+    () => sits.filter((s) => ["detected", "diagnosed", "acting", "needs_attention"].includes(s.status)),
     [sits],
   );
 
   const tally = useMemo(() => {
-    const t = { success: 0, rolled_back: 0, failure: 0 };
+    const t: Record<RemediationResult, number> = { success: 0, rolled_back: 0, failure: 0, escalated: 0 };
     for (const o of outcomes) t[o.result] = (t[o.result] ?? 0) + 1;
     return t;
   }, [outcomes]);
 
   const autoCount = open.filter((s) => s.hitl_mode === "auto").length;
   const hitlCount = open.filter((s) => s.hitl_mode === "hitl").length;
-  const graduated = playbooks.filter((p) => p.graduated).length;
+  const graduated = playbooks.filter(isGraduated).length;
   const pendingProposals = proposals.filter((p) => p.status === "proposed").length;
   const explainer = aiExplainerState(sys.llm);
 
@@ -240,7 +271,6 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
             value={metrics.noiseReductionPct}
             suffix="%"
             sub={`${metrics.alertsIngested.toLocaleString()} alerts → ${metrics.situationsOpen} open`}
-            spark={sparks.noise}
           />
           <Kpi
             label="Mean time to resolve"
@@ -248,7 +278,6 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
             suffix="min"
             decimals={1}
             sub="across successful remediations"
-            spark={sparks.mttr}
             color="#5E5CE6"
           />
           <Kpi
@@ -256,18 +285,50 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
             value={metrics.autoRemediatedPct}
             suffix="%"
             sub="ran without a human"
-            spark={sparks.auto}
             color="#34C759"
           />
           <Kpi
             label="Success rate"
             value={Math.round(metrics.successRate * 100)}
             suffix="%"
-            sub="verified healthy after fix"
-            spark={sparks.success}
+            sub={metrics.needsAttention > 0 ? `${metrics.needsAttention} escalated · needs a human` : "verified healthy after fix"}
             color="#34C759"
           />
         </div>
+      </Section>
+
+      {/* ── Real metric history, straight from Prometheus via read-service ─ */}
+      <Section delay={80}>
+        <Bezel coreClassName="p-6">
+          <Head
+            icon={<Waveform size={16} weight="light" />}
+            right={
+              <div className="flex items-center gap-1">
+                {METRIC_CHOICES.map((m) => (
+                  <button
+                    key={m.key}
+                    onClick={() => setMetric(m.key)}
+                    className={`rounded-full px-2.5 py-1 font-mono text-2xs transition-colors duration-200 ${
+                      metric === m.key
+                        ? "bg-signal/12 text-signal"
+                        : "text-ink-3 hover:bg-black/[0.04] hover:text-ink-2"
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            }
+          >
+            Live metrics
+          </Head>
+          <LiveChart history={history} unit={METRIC_CHOICES.find((m) => m.key === metric)?.unit ?? ""} />
+          <p className="mt-2 font-mono text-2xs text-ink-3">
+            {history.available
+              ? `${history.series.length} services · ${Math.round((history.end - history.start) / 60)}m window · ${history.step_seconds}s resolution · scraped by Prometheus`
+              : "Prometheus is not reachable from read-service — no history to draw."}
+          </p>
+        </Bezel>
       </Section>
 
       {/* ── Bento middle: live pulse (wide) + autonomy & safety (narrow) ─ */}
@@ -473,6 +534,7 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
                     <span className="text-sev-ok">{tally.success}✓</span>
                     <span className="text-sev-warn">{tally.rolled_back}↺</span>
                     <span className="text-sev-crit">{tally.failure}✕</span>
+                    <span className="text-sev-attention">{tally.escalated}⤴</span>
                   </span>
                 }
               >
@@ -492,7 +554,7 @@ export function Overview({ onView }: { onView: (v: View) => void }) {
                           {skin.icon}
                           <span className="hidden sm:inline">{skin.label}</span>
                         </span>
-                        <span className="min-w-0 flex-1 truncate text-sm text-ink">{o.playbook_id}</span>
+                        <span className="min-w-0 flex-1 truncate text-sm text-ink">{o.playbook_id || <span className="text-ink-3">no runbook — needs a human</span>}</span>
                         <span className="hidden font-mono text-2xs text-ink-3 sm:inline">{o.service}</span>
                         <span className="font-mono text-2xs text-ink-3">{timeAgo(o.ts)}</span>
                       </div>
