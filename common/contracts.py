@@ -77,6 +77,11 @@ class Situation(BaseModel):
     signature: str
     peak_score: float | None = None  # correlator max z-score for the window
     baseline: dict | None = None  # per-metric {name: {mean, std}} at emit time
+    # "quiet": correlation has seen this signature fixed reliably and asks for it
+    # to be handled without paging a human. A REQUEST, not a permission - action
+    # re-checks the evidence for the specific playbook before skipping approval,
+    # and every other safety gate still applies. Additive; defaults to "normal".
+    handling: str = "normal"  # "normal" | "quiet"
 
 
 class RootCauseHypothesis(BaseModel):
@@ -216,6 +221,9 @@ class RemediationOutcome(BaseModel):
     steps: list[str] = Field(default_factory=list)
     mode: str = "dry_run"  # "dry_run" | "k8s" | "none" (escalated: no executor ran)
     preflight: PreflightResult | None = None
+    # "quiet" when the fix ran without a human approval on the strength of its
+    # track record (see Situation.handling). Additive; defaults to "normal".
+    handling: str = "normal"
 
 
 class AuditRecord(BaseModel):
@@ -258,6 +266,11 @@ class TrainingRecord(BaseModel):
     result: RemediationResult
     worked: bool
     ts: datetime
+    # How the remediation ran ("dry_run" | "k8s" | ...), copied from the outcome.
+    # Additive and optional: records written before it existed load as None.
+    # Graduation needs it - a simulated success is not evidence that a playbook
+    # is safe to run unattended on a real cluster.
+    mode: str | None = None
 
 
 class TraceStepKind(str, Enum):

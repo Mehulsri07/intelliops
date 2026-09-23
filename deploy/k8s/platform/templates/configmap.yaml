@@ -12,6 +12,9 @@ metadata:
     {{- include "intelliops.labels" . | nindent 4 }}
 data:
   INTELLIOPS_AUTH_MODE: {{ .Values.env.AUTH_MODE | quote }}
+  # JSON lines when the Grafana/Loki stack is on, so each record's level is a
+  # searchable label there; human-readable text otherwise.
+  INTELLIOPS_LOG_FORMAT: {{ .Values.env.LOG_FORMAT | default (ternary "json" "text" .Values.observability.enabled) | quote }}
   INTELLIOPS_STORE_BACKEND: {{ .Values.env.STORE_BACKEND | quote }}
   INTELLIOPS_BUS_BACKEND: {{ .Values.env.BUS_BACKEND | quote }}
   # Delivery durability (issue #53) + read-model cold start (#58). All default to
@@ -41,6 +44,11 @@ data:
   # this correlator's name is meant to buy.
   INTELLIOPS_CORRELATION_ROBUST_WINDOW: {{ .Values.env.CORRELATION_ROBUST_WINDOW | default "128" | quote }}
   INTELLIOPS_CORRELATION_ROBUST_WARMUP: {{ .Values.env.CORRELATION_ROBUST_WARMUP | default "30" | quote }}
+  INTELLIOPS_CORRELATION_ROBUST_KEY_BY: {{ .Values.env.CORRELATION_ROBUST_KEY_BY | default "metric" | quote }}
+  # ADR-034: what suppression does to a reliably-fixed signature, and whether a
+  # qualifying playbook may then run without an approval request.
+  INTELLIOPS_SUPPRESSION_MODE: {{ .Values.env.SUPPRESSION_MODE | default "quiet" | quote }}
+  INTELLIOPS_QUIET_SKIP_APPROVAL: {{ .Values.env.QUIET_SKIP_APPROVAL | default "true" | quote }}
   INTELLIOPS_DETECTION_POLICY: {{ .Values.env.DETECTION_POLICY | quote }}
   INTELLIOPS_RUNBOOK_SELECTOR_MODE: {{ .Values.env.RUNBOOK_SELECTOR_MODE | quote }}
   INTELLIOPS_REMEDIATOR_MODE: {{ .Values.env.REMEDIATOR_MODE | quote }}

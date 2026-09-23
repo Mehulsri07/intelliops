@@ -20,7 +20,22 @@ class Settings(BaseSettings):
     hitl_poll_interval_seconds: float = 0.5
     training_store_path: str = "data/training.jsonl"
     reliability_suppress_threshold: float = 0.8
+    # Labelled outcomes a signature needs before it can be suppressed at all.
+    reliability_suppress_min_samples: int = 3
+    # How often RCA and correlation re-read the training store for track records.
+    reliability_refresh_seconds: float = 60.0
+    # What suppression does to a signature the system has reliably fixed:
+    # "quiet" (default) still diagnoses and remediates it, without paging a human
+    # when the playbook's own real track record clears the bar below; "drop" is
+    # the historical behaviour - never emitted, so never fixed.
+    suppression_mode: str = "quiet"  # "quiet" | "drop"
+    # Whether a quiet situation whose playbook qualifies may skip the HITL
+    # approval. False keeps quiet handling to logging/labelling only.
+    quiet_skip_approval: bool = True
     graduation_min_successes: int = 3
+    # Whether a dry-run SUCCESS counts toward graduating a playbook to AUTO. Off:
+    # a simulation always "succeeds", so it is no evidence a fix is safe unattended.
+    graduation_count_simulated: bool = False
 
     # --- live-stack settings (test-safe defaults) ---
     telemetry_mode: str = "file"  # "file" | "prometheus"
@@ -51,6 +66,9 @@ class Settings(BaseSettings):
     correlation_seasonal_buckets: int = 24
     correlation_robust_window: int = 128
     correlation_robust_warmup: int = 30
+    # "metric" (default, historical) pools every service's samples of a metric into
+    # one baseline; "series" keeps one per (metric, service). See RobustCorrelator.
+    correlation_robust_key_by: str = "metric"  # "metric" | "series"
     governance_mode: str = "in_process"  # "in_process" | "http"
     governance_url: str = "http://localhost:8005"
     # read-service asks rca for the authoritative LLM config rather than

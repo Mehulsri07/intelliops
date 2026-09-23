@@ -15,6 +15,7 @@ import {
 } from "@phosphor-icons/react";
 import { Bezel, PageHead, SevChip, StatusChip, motion as m, timeAgo } from "../components/primitives";
 import { loadSituations, loadSituationDetail, decideApproval, loadMetrics, loadOutcomes, draftAsync } from "../data/source";
+import { OPERATOR_NAME } from "../data/api";
 import { useLiveData } from "../hooks/useLiveData";
 import { pushToast } from "../hooks/useToast";
 import type { View } from "../components/Shell";
@@ -39,6 +40,10 @@ function failureNote(reason: string | undefined): string {
   if (!reason) return "no outcome detail recorded";
   if (reason === "unhealthy:rolled-back")
     return "the fix ran, health did not recover, and it was rolled back";
+  if (reason === "unhealthy:no-rollback")
+    return "the fix ran and health did not recover; the playbook has no rollback, so a human must check";
+  if (reason === "unhealthy:rollback-failed")
+    return "the fix ran, health did not recover, and the rollback itself FAILED — a human must check";
   if (reason.startsWith("interrupted:"))
     return "the attempt was interrupted mid-flight — whether the cluster changed is UNKNOWN, so a human must check";
   if (reason === "aborted:timeout")
@@ -49,6 +54,18 @@ function failureNote(reason: string | undefined): string {
   if (reason.startsWith("preflight")) return "the sandbox rehearsal failed, so it was never applied for real";
   if (reason.startsWith("skipped:")) return "the gate skipped this — nothing executed";
   return "gate failed closed — nothing executed";
+}
+
+/** A reliably-fixed signature: remediated without paging a human, still audited. */
+function QuietChip() {
+  return (
+    <span
+      className="rounded-md border border-line px-1.5 py-0.5 font-mono text-2xs text-ink-3"
+      title="This signature has been fixed reliably before. If its playbook's real track record qualifies, it runs without an approval request; either way the decision is in the audit log."
+    >
+      quiet
+    </span>
+  );
 }
 
 const METRIC_DOCS: Record<string, { title: string; formula: string; meaning: string }> = {
@@ -111,7 +128,7 @@ function MetricCard({
   const d = METRIC_DOCS[docKey];
   return (
     <button onClick={() => setOpen((o) => !o)} className="block w-full text-left">
-      <div className="rounded-lg border border-line bg-white/[0.03] p-4 transition-colors hover:bg-white/[0.05]">
+      <div className="rounded-lg border border-line bg-surface p-4 transition-colors hover:bg-surface-2">
         <div className="flex items-center justify-between">
           <span className="text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">{d.title}</span>
           <span className="font-mono text-2xs text-ink-4">{open ? "−" : "?"}</span>
@@ -258,7 +275,7 @@ export function Incidents({
     if (proposing || !sel) return;
     setProposing(true);
     try {
-      const { run_id } = await draftAsync(sel, "oncall-alice");
+      const { run_id } = await draftAsync(sel, OPERATOR_NAME);
       pushToast("success", "Drafting… see Agent Activity");
       onFocusRun?.(run_id);
       onView?.("agent-activity");
@@ -342,6 +359,7 @@ export function Incidents({
                         <div className="flex items-center gap-2">
                           <SevChip sev={s.severity} />
                           <StatusChip status={s.status} />
+                          {s.handling === "quiet" && <QuietChip />}
                         </div>
                         <span className="font-mono text-2xs text-ink-3">{timeAgo(s.first_seen)}</span>
                       </div>
@@ -378,6 +396,7 @@ export function Incidents({
                     <div className="flex items-center gap-2">
                       <SevChip sev={shown.severity} />
                       <StatusChip status={shown.status} />
+                      {shown.handling === "quiet" && <QuietChip />}
                     </div>
                     <h2 className="mt-3 text-2xl font-semibold tracking-tight">{shown.title}</h2>
                     <div className="mt-1.5 flex items-center gap-3 font-mono text-2xs text-ink-3">
@@ -386,13 +405,13 @@ export function Incidents({
                       <span>· {shown.memberCount} alerts collapsed</span>
                     </div>
                   </div>
-                  <div className="flex items-center gap-1.5 rounded-full border border-line-strong bg-white/[0.04] px-3 py-1.5 font-mono text-2xs text-ink-2">
+                  <div className="flex items-center gap-1.5 rounded-full border border-line-strong bg-surface-2 px-3 py-1.5 font-mono text-2xs text-ink-2">
                     <Cpu size={14} weight="light" /> {shown.service}
                   </div>
                 </div>
 
                 {/* pipeline rail */}
-                <div className="mt-6 rounded-lg border border-line bg-white/[0.03] p-4">
+                <div className="mt-6 rounded-lg border border-line bg-surface p-4">
                   <div className="space-y-1.5">
                     {stageDefs.map((st, i) => {
                       const done = i < stageIndex;
@@ -405,7 +424,7 @@ export function Incidents({
                       const isDone = done || doneAll;
                       return (
                         <div key={st.key} className={`flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors duration-500 ${now ? "bg-signal/[0.07]" : ""}`}>
-                          <span className={`flex h-7 w-7 flex-none items-center justify-center rounded-lg ${isDone ? "bg-sev-ok/15 text-sev-ok" : now ? "bg-signal/15 text-signal" : "bg-white/[0.06] text-ink-3"}`}>
+                          <span className={`flex h-7 w-7 flex-none items-center justify-center rounded-lg ${isDone ? "bg-sev-ok/15 text-sev-ok" : now ? "bg-signal/15 text-signal" : "bg-surface-2 text-ink-3"}`}>
                             {isDone ? <Check size={14} weight="bold" /> : now && working ? <CircleNotch size={14} weight="bold" className="animate-spin" /> : st.icon}
                           </span>
                           <div className="min-w-0">
@@ -433,14 +452,14 @@ export function Incidents({
                       {shown.member_events.slice(0, 6).map((ev, i) => {
                         const b = shown.baseline?.[ev.name];
                         return (
-                          <div key={i} className="flex items-center gap-3 rounded-lg bg-white/[0.03] px-3 py-1.5 font-mono text-2xs">
+                          <div key={i} className="flex items-center gap-3 rounded-lg bg-surface px-3 py-1.5 font-mono text-2xs">
                             <span className="text-ink">{ev.name}</span>
                             <span className="text-signal-dim">{ev.value ?? "—"}</span>
                             {b && <span className="text-ink-3">vs baseline {fmtBaseline(b.mean)}±{fmtBaseline(b.std)}</span>}
                             {shown.peak_score != null && i === 0 && <span className="text-sev-warn">z ≈ {shown.peak_score.toFixed(1)}</span>}
                             {ev.kind_detected && (
                               <span
-                                className="ml-auto rounded bg-white/[0.06] px-1.5 py-0.5 text-ink-3"
+                                className="ml-auto rounded bg-surface-2 px-1.5 py-0.5 text-ink-3"
                                 title={DETECTION_KIND_DOC[ev.kind_detected]}
                               >
                                 {DETECTION_KIND_LABEL[ev.kind_detected]}
@@ -461,7 +480,7 @@ export function Incidents({
                   </div>
                   <div className="space-y-2">
                     {shown.hypotheses.map((h, i) => (
-                      <div key={i} className={`rounded-xl border p-3 ${i === 0 ? "border-signal/25 bg-signal/[0.05]" : "border-line bg-white/[0.03]"}`}>
+                      <div key={i} className={`rounded-xl border p-3 ${i === 0 ? "border-signal/25 bg-signal/[0.05]" : "border-line bg-surface"}`}>
                         <div className="flex items-center justify-between gap-3">
                           <span className="text-sm text-ink-2">{h.description}</span>
                           <span className="flex flex-none items-center gap-1.5 font-mono text-2xs text-ink-3">
@@ -474,7 +493,7 @@ export function Incidents({
                               </span>
                             ) : h.confidence_source === "rule" ? (
                               <span
-                                className="rounded bg-white/[0.06] px-1.5 py-0.5 text-ink-3"
+                                className="rounded bg-surface-2 px-1.5 py-0.5 text-ink-3"
                                 title="Confidence is the deterministic rule fallback (no embedding selector active for this candidate)."
                               >
                                 rule
@@ -484,10 +503,10 @@ export function Incidents({
                           </span>
                         </div>
                         <div className="mt-2 flex items-center gap-2">
-                          <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/[0.08]">
+                          <div className="h-1 flex-1 overflow-hidden rounded-full bg-surface-3">
                             <div className={`h-full rounded-full ${i === 0 ? "bg-signal" : "bg-ink-4"}`} style={{ width: `${h.confidence * 100}%` }} />
                           </div>
-                          {h.suggested_runbook_id && <span className="rounded-md bg-white/[0.06] px-2 py-0.5 font-mono text-2xs text-ink-2">{h.suggested_runbook_id}</span>}
+                          {h.suggested_runbook_id && <span className="rounded-md bg-surface-2 px-2 py-0.5 font-mono text-2xs text-ink-2">{h.suggested_runbook_id}</span>}
                         </div>
                         {h.evidence && h.evidence.length > 0 && (
                           <ul className="mt-2 space-y-0.5">
@@ -497,7 +516,7 @@ export function Incidents({
                           </ul>
                         )}
                         {i === 0 && h.explanation && (
-                          <div className="mt-2 rounded-lg bg-white/[0.04] p-2 text-2xs leading-relaxed text-ink-2">
+                          <div className="mt-2 rounded-lg bg-surface-2 p-2 text-2xs leading-relaxed text-ink-2">
                             <span className="font-mono text-ink-3">
                               {h.explanation_source === "llm"
                                 ? "AI explanation"
@@ -514,14 +533,19 @@ export function Incidents({
                 </div>
 
                 {/* the gate / result */}
-                <div className="mt-5 rounded-lg border border-line bg-white/[0.04] p-4">
+                <div className="mt-5 rounded-lg border border-line bg-surface-2 p-4">
                   {shown.status === "resolved" ? (
                     <div className="flex items-start gap-3">
                       <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-full bg-sev-ok/15 text-sev-ok"><Check size={17} weight="bold" /></span>
                       <div>
                         <div className="text-sm font-medium text-ink">
                           Resolved · <span className="font-mono text-sev-ok">{shown.outcome?.health_after ?? "resolved"}</span>
-                          {shown.outcome?.mode === "dry_run" && <span className="ml-2 rounded-md bg-white/[0.06] px-1.5 py-0.5 font-mono text-2xs text-ink-3">dry-run</span>}
+                          {shown.outcome?.mode === "dry_run" && <span className="ml-2 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-2xs text-ink-3">dry-run</span>}
+                          {shown.outcome?.handling === "quiet" && (
+                            <span className="ml-2 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-2xs text-ink-3">
+                              handled quietly · no approval needed (proven fix, audited)
+                            </span>
+                          )}
                         </div>
                         {shown.outcome?.steps && shown.outcome.steps.length > 0 && (
                           <div className="mt-1 font-mono text-2xs text-ink-3">steps: {shown.outcome.steps.join(" → ")}</div>
@@ -648,7 +672,7 @@ export function Incidents({
                       <div className="flex items-center gap-2">
                         <span className="flex h-2 w-2 animate-beat rounded-full bg-sev-warn" />
                         <span className="text-sm font-medium text-ink">Human approval required</span>
-                        <span className="ml-auto rounded-md bg-white/[0.06] px-2 py-0.5 font-mono text-2xs text-ink-2">{shown.suggested_runbook_id} · hitl</span>
+                        <span className="ml-auto rounded-md bg-surface-2 px-2 py-0.5 font-mono text-2xs text-ink-2">{shown.suggested_runbook_id} · hitl</span>
                       </div>
                       <p className="mt-1.5 font-mono text-2xs text-ink-3">action-service is authorized to <span className="text-ink-2">execute</span> this reversible playbook. Approve to run it, or reject to hold.</p>
                       <div className="mt-3 flex gap-2">
@@ -656,7 +680,7 @@ export function Incidents({
                           {gateBusy ? <CircleNotch size={15} weight="bold" className="animate-spin" /> : <Check size={15} weight="bold" />}
                           {gateBusy ? "Approving…" : "Approve & remediate"}
                         </button>
-                        <button onClick={reject} disabled={gateBusy} className="flex items-center gap-2 rounded-full border border-line-strong bg-white/[0.05] px-5 py-2.5 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-white/[0.07] active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white/[0.05]">
+                        <button onClick={reject} disabled={gateBusy} className="flex items-center gap-2 rounded-full border border-line-strong bg-surface-2 px-5 py-2.5 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-surface-3 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-2">
                           <X size={15} weight="bold" /> Reject
                         </button>
                         {!LIVE && (
@@ -680,7 +704,7 @@ export function Incidents({
       </div>
 
       {recentOutcomes.length > 0 && (
-        <div className="rounded-lg border border-line bg-white/[0.03] p-4">
+        <div className="rounded-lg border border-line bg-surface p-4">
           <div className="mb-2 text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">Recent outcomes</div>
           <div className="space-y-1">
             {recentOutcomes.slice(0, 5).map((o, i) => (

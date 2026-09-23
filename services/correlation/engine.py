@@ -38,15 +38,31 @@ class CorrelationEngine:
         suppress_threshold: float = 0.8,
         group_by: str = "window",
         min_events: int = 1,
+        suppress_min_samples: int = 1,
+        suppress_mode: str = "drop",
     ) -> None:
         self._correlator = correlator
-        self._correlator_factory = lambda: type(correlator)(
-            z_threshold=correlator._z_threshold,
-            warmup_samples=correlator._warmup_samples,
-            detection_policy=correlator._policy,
+        self._correlator_factory = (
+            correlator.clone_empty
+            if hasattr(correlator, "clone_empty")
+            else lambda: type(correlator)(
+                z_threshold=correlator._z_threshold,
+                warmup_samples=correlator._warmup_samples,
+                detection_policy=correlator._policy,
+            )
         )
         self._window = window_seconds
         self._suppress_threshold = suppress_threshold
+        self._suppress_min_samples = max(1, int(suppress_min_samples))
+        # What suppression DOES to a reliably-fixed signature:
+        #   "drop"  (historical default here): the Situation is never emitted, so
+        #           it never reaches RCA or action - the fault is left unfixed.
+        #   "quiet": the Situation IS emitted, marked handling="quiet", so it is
+        #           still diagnosed and remediated, just without paging a human
+        #           when action can confirm the playbook's track record.
+        # Either way it is also queued for situations.suppressed (the counter
+        # and the log of what was suppressed).
+        self._suppress_mode = suppress_mode
         self._group_by = group_by
         # How many anomalous events a window must hold before it is an incident.
         #
@@ -64,7 +80,9 @@ class CorrelationEngine:
         # this is the old single-buffer behaviour with one dict lookup.
         self._buffers: dict[str, list[TelemetryEvent]] = {}
         self._max_scores: dict[str, float] = {}
-        self._suppressed: Situation | None = None
+        # A queue, not a slot: one flush_all() can suppress several buckets, and a
+        # single slot kept only the last, silently dropping the rest.
+        self._suppressed: list[Situation] = []
         # Guards _buffer/_max_score so a background time-flush (see the service
         # lifespan) can run concurrently with add() on the consumer thread.
         # Single-threaded callers (tests) are unaffected — the lock is uncontended.
@@ -154,11 +172,22 @@ class CorrelationEngine:
         sit = sit.model_copy(update={"peak_score": peak, "baseline": baseline})
         self._buffers.pop(key, None)
         self._max_scores.pop(key, None)
-        # Closed loop: suppress a Situation whose signature reliably self-heals.
-        if self._correlator.should_suppress(sit.signature, self._suppress_threshold):
-            self._suppressed = sit
+        # Closed loop: a signature the system has reliably fixed before.
+        if self._correlator.should_suppress(
+            sit.signature, self._suppress_threshold, self._suppress_min_samples
+        ):
+            if self._suppress_mode == "quiet":
+                sit = sit.model_copy(update={"handling": "quiet"})
+                self._suppressed.append(sit)
+                return sit
+            self._suppressed.append(sit)
             return None
         return sit
+
+    def retrain(self, training_data: list[dict]) -> None:
+        """Replace the reliability map (what suppression reads) under the lock."""
+        with self._lock:
+            self._correlator.retrain(training_data)
 
     def snapshot(self) -> list[dict]:
         with self._lock:
@@ -169,14 +198,20 @@ class CorrelationEngine:
             self._correlator.load(rows)
 
     def pop_suppressed(self) -> Situation | None:
+        """Oldest suppressed Situation not yet published, or None."""
         with self._lock:
-            s = self._suppressed
-            self._suppressed = None
-            return s
+            return self._suppressed.pop(0) if self._suppressed else None
 
     def reset(self) -> None:
         with self._lock:
+            # A baseline reset forgets what "normal" looks like, not which fixes
+            # have worked: the reliability map comes from labelled outcomes and is
+            # re-derived from them anyway, so carry it across.
+            old = self._correlator
             self._correlator = self._correlator_factory()
+            for attr in ("_reliability", "_samples"):
+                if hasattr(old, attr):
+                    setattr(self._correlator, attr, getattr(old, attr))
             self._buffers = {}
             self._max_scores = {}
-            self._suppressed = None
+            self._suppressed = []
