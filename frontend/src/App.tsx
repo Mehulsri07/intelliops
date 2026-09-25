@@ -5,18 +5,25 @@ import { Incidents } from "./views/Incidents";
 import { Governance } from "./views/Governance";
 import { AgentActivity } from "./views/AgentActivity";
 import { System } from "./views/System";
+import Dashboard from "./pages/Dashboard";
+import AuditLog from "./pages/AuditLog";
+import Product from "./pages/Product";
+import Docs from "./pages/Docs";
 import "./styles/view.css";
 
+type Page = "console" | "dashboard" | "audit-log" | "product" | "docs";
+
 export default function App() {
+  const [page, setPage] = useState<Page>("console");
   const [view, setView] = useState<View>("overview");
-  // Deep-link a specific agent run into the Agent Activity tab — set by
-  // Incidents' "Draft a runbook with AI" button, consumed by AgentActivity.
   const [focusRun, setFocusRun] = useState<string | null>(null);
 
-  // The view mounts at full opacity (no Framer mount animation — that strands
-  // at opacity 0 under StrictMode's double-invoke). Entrance polish comes from
-  // a CSS keyframe on the keyed wrapper plus the per-section whileInView reveals
-  // inside each view, which are unaffected.
+  // Standalone pages render outside the console Shell
+  if (page === "dashboard") return <Dashboard />;
+  if (page === "audit-log") return <AuditLog />;
+  if (page === "product")   return <Product />;
+  if (page === "docs")      return <Docs />;
+
   return (
     <Shell view={view} onView={setView}>
       <div key={view} className="view-enter">
