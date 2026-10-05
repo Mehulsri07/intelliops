@@ -9,23 +9,36 @@ export type SituationStatus =
   | "acting"
   | "resolved"
   | "failed"
+  // terminal, but NOT a failure: nothing was executed because there was no
+  // candidate fix — a human has to look.
+  | "needs_attention"
   | "suppressed";
 
 export type HitlMode = "auto" | "hitl" | "disabled";
 
-export type RemediationResult = "success" | "failure" | "rolled_back";
+export type RemediationResult = "success" | "failure" | "rolled_back" | "escalated";
 
 /** The exact health_after vocabulary the action service emits. */
 export type OutcomeReason =
   | "healthy"
   | "unhealthy:rolled-back"
+  | "unhealthy:no-rollback"
+  | "unhealthy:rollback-failed"
   | "execute-failed"
+  | "preflight-failed"
+  | "interrupted:unknown"
+  | "denied:unsafe-scale"
+  | "denied:unsafe-limits"
+  | "denied:unsafe-probe"
+  | "denied:unsafe-revision"
   | "denied:rbac"
   | "refused:not-reversible"
   | "aborted:rejected"
   | "aborted:timeout"
   | "skipped:disabled"
-  | "skipped:no-playbook";
+  | "skipped:no-playbook"
+  | "escalated:no-diagnosis"
+  | "escalated:unknown-runbook";
 
 export type Severity = "critical" | "high" | "medium" | "low";
 
@@ -42,7 +55,8 @@ export interface Hypothesis {
 export interface SituationOutcome {
   result: RemediationResult;
   health_after: OutcomeReason;
-  mode: "dry_run" | "k8s";
+  // "none" is the escalation case — no executor ran at all.
+  mode: "dry_run" | "k8s" | "none";
   steps: string[];
   preflight?: {
     passed: boolean;
@@ -50,7 +64,12 @@ export interface SituationOutcome {
     mode: "off" | "k8s";
     sandbox_namespace?: string | null;
   } | null;
+  /** "quiet": the fix ran without anyone being asked, on the playbook's real track record. */
+  handling?: Handling;
 }
+
+/** "quiet" = a reliably-fixed signature, handled without paging a human (and audited). */
+export type Handling = "normal" | "quiet";
 
 export interface Situation {
   id: string; // "sit-" + signature
@@ -67,11 +86,14 @@ export interface Situation {
   reversible: boolean;
   reliability: number; // per-signature reliability (0..1)
   suppressed: boolean;
+  handling?: Handling; // "quiet" = correlation asked for this to be handled without paging
   outcome?: SituationOutcome; // present once remediation has produced a result
   peak_score?: number | null;
   baseline?: Record<string, { mean: number; std: number }> | null;
   member_events?: MemberEvent[];
-  stages?: Partial<Record<"detected" | "diagnosed" | "acting" | "resolved" | "failed", number>>;
+  stages?: Partial<
+    Record<"detected" | "diagnosed" | "acting" | "resolved" | "failed" | "needs_attention", number>
+  >;
 }
 
 export interface OutcomeRow {
@@ -81,13 +103,14 @@ export interface OutcomeRow {
   reason: OutcomeReason;
   ts: number;
   service: string;
+  handling?: Handling;
 }
 
 export interface AuditRow {
   actor: string;
   action: string;
   resource: string;
-  decision: "allow" | "deny" | "pending";
+  decision: "allow" | "deny" | "pending" | "escalated";
   ts: number;
   correlation_id: string;
 }
@@ -97,11 +120,18 @@ export interface Playbook {
   name: string;
   hitl_mode: HitlMode;
   reversible: boolean;
-  successes: number;
-  rollbacks: number;
-  failures: number;
-  graduated: boolean;
+  symptoms?: string | null;
+  // GET /playbooks does not serve a track record. These were declared required,
+  // so every consumer read `undefined` and rendered 0 forever - the "graduated
+  // playbooks" tile contradicted the copy directly above it. Optional now, and
+  // graduation is derived from hitl_mode instead (see isGraduated).
+  successes?: number;
+  rollbacks?: number;
+  failures?: number;
 }
+
+/** Graduation IS hitl -> auto, and hitl_mode is served, so this needs no new API. */
+export const isGraduated = (p: Playbook): boolean => p.hitl_mode === "auto";
 
 export interface ServiceHealth {
   name: string;
@@ -120,6 +150,8 @@ export interface Metrics {
   suppressedToday: number;
   approvalsPending: number;
   successRate: number; // 0..1
+  needsAttention: number; // escalations awaiting a human — excluded from successRate
+  quietlyHandled?: number; // fixes that ran without anyone being asked (proven track record)
 }
 
 export interface MemberEvent {
@@ -140,6 +172,12 @@ export interface SystemInfo {
   store_backend: string;
   remediator_mode: string;
   auth_mode: string;
+  // Reported by read-service. The console used to assert "fixes rehearsed on a
+  // throwaway clone first" as a fixed line of copy, which is a claim about a
+  // setting that is off in the live posture. Read it instead of stating it.
+  sandbox_mode?: string;
+  health_check_mode?: string;
+  detection_policy?: string;
   llm: {
     provider: "template" | "openai-compatible";
     endpoint_configured: boolean;
@@ -151,6 +189,10 @@ export interface SystemInfo {
 
 export interface BaselineInfo {
   correlator_kind: string;
+  // Which statistic the running correlator actually computes. `river` keeps a
+  // running mean/stddev; `robust` a median and a MAD-derived sigma. Labelling
+  // both "mean" was wrong on the page that promises nothing is staged.
+  statistic?: "median/MAD" | "mean/stddev";
   // mean/count are null for the robust correlator (median/MAD per hour-bucket,
   // no running mean); std may be 0 before enough samples. Guard before formatting.
   baselines: { metric_name: string; mean: number | null; std: number | null; count: number | null }[];
@@ -235,4 +277,22 @@ export interface RunSummary {
   signature: string;
   step_count: number;
   proposal_id?: string | null;
+}
+
+/** A real time-series from GET /metrics/history (Prometheus, proxied by read). */
+export interface MetricSeries {
+  service: string;
+  /** [unix_seconds, value] pairs, oldest first. */
+  points: [number, number][];
+}
+
+export interface MetricHistory {
+  metric: string;
+  /** false when Prometheus could not be reached - render "no data", never a fake shape. */
+  available: boolean;
+  reason?: string;
+  start: number;
+  end: number;
+  step_seconds: number;
+  series: MetricSeries[];
 }

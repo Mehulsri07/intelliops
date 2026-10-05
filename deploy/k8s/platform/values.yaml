@@ -64,15 +64,42 @@ env:
   AUTH_MODE: "off"
   STORE_BACKEND: postgres
   BUS_BACKEND: redis
+  # Durability posture. at_least_once needs a STABLE consumer name per consumer and
+  # replicas:1 (see ADR-033); the chart pins replicas:1, so it is safe to flip.
+  BUS_DELIVERY: "at_most_once"      # at_least_once in values-live
+  BUS_DLQ_MODE: "off"               # on in values-live (park poison payloads)
+  BUS_IDEMPOTENCY_MODE: "off"       # redis in values-live (makes redelivery safe)
+  READ_REBUILD_MODE: "off"          # replay in values-live (console survives a restart)
+  CORRELATION_GROUP_BY: "window"    # service in values-live (concurrent faults stay apart)
   CORRELATOR_KIND: "river"          # robust in values-live (seasonal baselines)
   DETECTION_POLICY: "off"           # on in values-live (Phase 2)
   RUNBOOK_SELECTOR_MODE: "off"      # embedding in values-live (Phase 3)
   REMEDIATOR_MODE: "dry_run"        # k8s in values-live (real remediation)
-  SANDBOX_MODE: "off"               # k8s in values-live (pre-flight rehearsal)
+  SANDBOX_MODE: "off"               # off in values-live too (ADR-029); k8s via docker-compose.k8s.yml
   HEALTH_CHECK_MODE: "always"       # k8s in values-live (Phase 4 per-metric verify)
+  # Must stay comfortably above the remediated workload's termination grace
+  # period; see the configmap comment. 30 (the old hardcoded value) equalled
+  # the default grace period and so always lost by a fraction of a second.
+  HEALTH_CHECK_TIMEOUT_SECONDS: "90"
   PROMETHEUS_URL: "http://prometheus:9090"
   TELEMETRY_MODE: "file"            # "prometheus" in values-live (poll real metrics)
   PROMETHEUS_QUERY: "cpu_usage"     # values-live widens this to all metric families
+  # Idle jitter on the simulated workloads' gauges. Off here so the chart's
+  # default posture emits the exact constants the unit tests assert; the live
+  # overlay turns it on so the console charts show telemetry, not ruled lines.
+  TELEMETRY_JITTER: "0"
+  CORRELATION_MIN_EVENTS: "1"   # values-live raises this; 1 = historical behaviour
+  CORRELATION_ROBUST_WINDOW: "128"
+  CORRELATION_ROBUST_WARMUP: "30"   # values-live requires a FULL window instead
+  # "series" gives each (metric, service) its own baseline instead of pooling
+  # every service into one per metric. Re-tune warm-up before flipping it: a
+  # per-series window fills ~5x slower (one sample per poll, not five).
+  CORRELATION_ROBUST_KEY_BY: "metric"
+  # ADR-034. "quiet": a reliably-fixed signature is still remediated, without an
+  # approval request when its playbook's REAL track record qualifies (audited +
+  # logged). "drop": the old behaviour - never emitted, never fixed.
+  SUPPRESSION_MODE: "quiet"
+  QUIET_SKIP_APPROVAL: "true"
   GOVERNANCE_MODE: "in_process"     # "http" in values-live — action + governance are
   GOVERNANCE_URL: "http://governance:8000"  # separate pods, so approvals must go over HTTP
   HITL_POLL_TIMEOUT_SECONDS: "30"   # values-live raises this so a human has time to click Approve
@@ -113,7 +140,14 @@ demoApp:
   port: 8080
 meridian:
   enabled: true
+  # Bind the gateway to a host port so /api/ops/fault is reachable without a
+  # kubectl port-forward. 0/empty keeps it cluster-internal.
+  gatewayNodePort: 30808
   image: ""              # "" → base image
+  # Stateless simulators with nothing to flush. Kept well below the health
+  # check's deadline so a remediated pod stops counting toward status.replicas
+  # quickly and verification can actually observe recovery.
+  terminationGracePeriodSeconds: 5
   services:
     - { name: meridian-gateway, module: "services.meridian.gateway.app:app" }
     - { name: meridian-validation, module: "services.meridian.validation.app:app" }
@@ -122,6 +156,9 @@ meridian:
 prometheus:
   enabled: true
   image: prom/prometheus:v2.54.1   # pinned for reproducibility (not :latest)
+  # Host-reachable so a demo can show the raw series behind an incident.
+  # 0/empty keeps it cluster-internal.
+  nodePort: 30090
 
 # The React console: nginx serving the built SPA + same-origin reverse-proxy to
 # the read service (SSE-safe). Exposed via NodePort for the browser on kind.
@@ -156,3 +193,22 @@ postgres:
   # Durable storage size for the StatefulSet's PVC (issue #55). The DB survives
   # a pod reschedule now; size to taste (audit/approval/training/trace rows).
   storage: 1Gi
+
+# Logs + metrics UI (Grafana + Loki + Alloy). Grafana is served on a NodePort:
+#   kind:  http://localhost:30300   (deploy/k8s/kind-config-full.yaml maps it)
+#   other: kubectl port-forward svc/grafana 3000:3000 -> http://localhost:3000
+# One dashboard: every pod's logs (via Loki), the Prometheus metrics, and the
+# Postgres audit trail. Enabling it also switches the services to JSON logs so
+# levels are searchable.
+observability:
+  enabled: true
+  grafana:
+    image: grafana/grafana:11.3.0
+    nodePort: 30300
+    # Anonymous visitors get read-only Viewer access. Set false for anything shared.
+    anonymous: true
+    adminPassword: admin   # change with --set-string observability.grafana.adminPassword=...
+  loki:
+    image: grafana/loki:3.2.1
+  alloy:
+    image: grafana/alloy:v1.4.3

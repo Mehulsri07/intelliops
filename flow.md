@@ -6,12 +6,13 @@ and why**. Read it alongside:
 - [architectural.md](architectural.md) — *why* the system is shaped this way (ADRs).
 - [docs/superpowers/specs/2026-08-13-intelliops-coe-design.md](docs/superpowers/specs/2026-08-13-intelliops-coe-design.md) — the full spec.
 
-> **Status (updated 2026-08-18).** The six-service closed loop is **built and running
+> **Status (updated 2026-09-22).** The six-service closed loop is **built and running
 > end-to-end**, plus three things that came after the original design: a **read-model service**
 > (the CQRS read side the dashboard reads from), a **React operator console**, and a **live,
 > repeatably-runnable demo stack** on docker-compose. What ran only as a "target design" in the
 > first draft now runs live — including remediation itself, which can now drive a real
-> Kubernetes cluster behind an opt-in switch (dry-run stays the production-safe default). See
+> Kubernetes cluster behind an opt-in switch (dry-run stays the production-safe default). Kafka
+> bus binding and whole-stack Helm deploy are also shipped. See
 > [§8 Current status & what's next](#8-current-status--whats-next) for exactly what's real, what's
 > still simulated, and what's next.
 >
@@ -106,7 +107,7 @@ instead of waiting out a poll interval ([ADR-018](architectural.md#adr-018--real
 | `telemetry.raw` | ingestion | correlation | `TelemetryEvent` | a normalized signal |
 | `situations.detected` | correlation | rca, **read** | `Situation` (detected) | an alert storm collapsed into one incident |
 | `situations.diagnosed` | rca | action, **read** | `DiagnosedSituation` (situation + hypotheses) | incident with likely cause + suggested fix |
-| `situations.suppressed` | correlation | **read** | `Situation` (suppressed) | a signature that reliably self-heals — detected, then *not* emitted as an incident (closed-loop suppression, made visible for metrics) |
+| `situations.suppressed` | correlation | **read** | `Situation` (suppressed) | a signature the system has reliably fixed. Under the default `suppression_mode=quiet` it is ALSO emitted on `situations.detected` with `handling="quiet"` and remediated without paging a human when the playbook's real track record qualifies; this topic is the record of it ([ADR-034](architectural.md#adr-034--suppression-means-handle-quietly-not-drop)) |
 | `remediation.outcomes` | action | feedback, **read** | `RemediationOutcome` | did the fix work / roll back |
 | `audit.events` | all services | governance | `AuditRecord` | append-only trail (fire-and-forget) |
 
@@ -242,10 +243,12 @@ the unmodified z-score (default `off`, byte-identical). See
 |----------|--------------|-----|-----------|
 | `check_rbac(actor, action, resource) → allow \| deny` | Decides whether an actor may perform an action. | Every automated action passes here — the enforceable RBAC guarantee. | RBAC policy |
 | `create_approval_request() → ApprovalRequest` | Opens a pending approval for a `hitl` playbook. | Materializes the human decision point. | `contracts.ApprovalRequest` |
-| `decide(id, approve \| reject)` | REST endpoint (`POST /approvals/{id}/decide`) a human/console calls to approve or reject. | The approval interface the React console's Approve/Reject buttons drive. | — |
+| `decide(id, approve \| reject)` | REST endpoint (`POST /approvals/{id}/decide`) a human/console calls to approve or reject. Only `approved`/`rejected` are accepted (422 otherwise), the decider needs the matching `approve`/`reject` permission, a request that is no longer pending is a 409, and the decision is written to the audit log under the human's name. | The approval interface the React console's Approve/Reject buttons drive. | RBAC, `AuditSink` |
+| `expire(id)` | `POST /approvals/{id}/expire` — the requester (action-service) marks a request it stopped waiting for as `expired` at its HITL timeout. | Without it a timed-out request stayed `pending` forever and the console offered an Approve that could no longer do anything. | `AuditSink` |
 | `get_approval(id)` / `list_approvals()` | REST reads (`GET /approvals/{id}`, `GET /approvals`) of the pending queue. | Lets the HTTP gate poll for a decision across containers, and the dashboard show what's pending. | — |
 | `write_audit(record)` | Appends an immutable `AuditRecord`. | The compliance backbone (NIST AI RMF / DORA / EU AI Act). | `AuditSink` |
-| `register_playbook()` / `list_playbooks()` | Maintains the CoE playbook registry. | Standardization — playbooks are shared, not reinvented per team. | playbook store |
+| `register_playbook()` / `list_playbooks()` | Maintains the CoE playbook registry. `POST /playbooks?registered_by=` needs the `register` permission (coe-admin), refuses `hitl_mode=auto` unless the actor may also `graduate`, and is audited. | Standardization — playbooks are shared, not reinvented per team. A direct write bypasses the AI-proposal review, so it is an admin action, not an open one. | playbook store, RBAC |
+| `graduate(id)` / `demote(id)` | `POST /playbooks/{id}/graduate` (hitl → auto) and `POST /playbooks/{id}/demote` (auto → hitl), both behind the `graduate` permission and audited. feedback-service calls graduate on clean **real** evidence (dry-run successes don't count unless `GRADUATION_COUNT_SIMULATED`) and demote when an auto playbook fails or rolls back. | Automation expands on evidence and contracts on failure. | RBAC, playbook store, `AuditSink` |
 | `propose_playbook(situation) → ProposedPlaybook` | `POST /playbooks/proposed`: calls a `RunbookAuthor` (LLM) to draft a typed runbook for a gap, forces `hitl_mode=HITL` + a server-assigned id, stores it as a **proposal** (not the live registry); 422 if the author declines. | The AI **proposes** a runbook for a gap; `model_validate` rejects any unsafe draft ([ADR-025](architectural.md#adr-025--ai-authored-runbooks-propose--approve)). | `RunbookAuthor`, proposed store |
 | `approve_proposed(id)` / `reject_proposed(id)` | `POST /playbooks/proposed/{id}/approve\|reject` — RBAC-gated (reuses `approve`/`reject`), audited. **Approve registers the inner playbook into the live registry**; reject does not. | The human **disposes** — the only path from an AI draft to the live registry ([ADR-025](architectural.md#adr-025--ai-authored-runbooks-propose--approve)). | RBAC, playbook store, `AuditSink` |
 
@@ -253,9 +256,9 @@ the unmodified z-score (default `off`, byte-identical). See
 
 | Function | What it does | Why | Depends on |
 |----------|--------------|-----|-----------|
-| `label_outcome(outcome) → TrainingRecord` | Turns a `RemediationOutcome` into a labeled training example (worked / failed / rolled back). | Converts operational results into learning signal — the innovation. | `contracts.RemediationOutcome` |
+| `label_outcome(outcome) → TrainingRecord` | Turns a `RemediationOutcome` into a labeled training example (worked / failed / rolled back). **Escalations never get here** — the consumer drops `result=escalated` before the store write, because nothing was attempted and it is therefore no evidence about any runbook. | Converts operational results into learning signal — the innovation. | `contracts.RemediationOutcome` |
 | `persist(record)` | Writes the labeled record to the training store `correlation-service` reads. | The physical link that closes the loop. | training store |
-| `compute_metrics()` | Tracks success/rollback/failure rates and per-signature reliability from outcomes. | Proves remediation quality with real numbers. *(True MTTR/MTTD, which need detection→resolution timestamps, are computed by the read-service — see §5.7.)* | outcome + situation history |
+| `compute_metrics()` | Tracks success/rollback/failure rates and per-signature reliability from outcomes, over **attempted** remediations only (escalations are excluded from the denominator). | Proves remediation quality with real numbers. *(True MTTR/MTTD, which need detection→resolution timestamps, are computed by the read-service — see §5.7.)* | outcome + situation history |
 
 ### 5.7 `read-service` — the CQRS read side the dashboard reads from
 

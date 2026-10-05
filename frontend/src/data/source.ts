@@ -1,6 +1,6 @@
 import * as api from "./api";
 import * as mock from "./mock";
-import type { LlmProbe, ProposedPlaybook, RunSummary, Situation, SystemInfo, TraceStep } from "./types";
+import type { LlmProbe, MetricHistory, ProposedPlaybook, RunSummary, Situation, SystemInfo, TraceStep } from "./types";
 
 const LIVE = import.meta.env.VITE_DATA_MODE === "live";
 
@@ -28,6 +28,19 @@ export const loadOutcomes = LIVE ? api.loadOutcomes : async () => mock.outcomes;
 export const loadAudit = LIVE ? api.loadAudit : async () => mock.audit;
 export const loadPlaybooks = LIVE ? api.loadPlaybooks : async () => mock.playbooks;
 export const loadMetrics = LIVE ? api.loadMetrics : async () => mock.metrics;
+// No mock history: a fabricated graph is exactly what this replaced. In mock
+// mode the chart shows its honest "no data" state instead.
+export const loadMetricHistory = LIVE
+  ? api.loadMetricHistory
+  : async (metric: string): Promise<MetricHistory> => ({
+      metric,
+      available: false,
+      reason: "mock mode - no metric history",
+      start: 0,
+      end: 0,
+      step_seconds: 0,
+      series: [],
+    });
 export const decideApproval = LIVE
   ? api.decideApproval
   : async () => {
@@ -47,33 +60,6 @@ export const testLlmConfig = LIVE
     });
 
 export const loadProposals = LIVE ? api.loadProposals : async () => _mockProposals;
-
-export const proposePlaybook = LIVE
-  ? api.proposePlaybook
-  : async (situation: Situation, _requestedBy: string): Promise<ProposedPlaybook> => {
-      // mock mode: fabricate a proposal the same shape the server would return
-      // (server-assigned id, forced hitl) — honest about being a stub draft.
-      const proposal: ProposedPlaybook = {
-        id: `prop-mock-${Date.now().toString(36)}`,
-        playbook: {
-          id: `ai-${situation.signature}-mock`,
-          name: `Drafted fix · ${situation.service}`,
-          match_rule: situation.id,
-          steps: [{ action: "restart", note: "mock draft — no LLM configured" }],
-          hitl_mode: "hitl",
-          reversible: true,
-          rollback_steps: [],
-        },
-        status: "proposed",
-        proposed_by: "runbook-author",
-        rationale: "mock mode: no LLM configured — this is a stub draft, not a real AI proposal.",
-        source_situation_id: situation.id,
-        decided_by: null,
-        ts: Date.now(),
-      };
-      _mockProposals.push(proposal);
-      return proposal;
-    };
 
 export const approveProposal = LIVE
   ? api.approveProposal

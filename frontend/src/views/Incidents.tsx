@@ -6,14 +6,16 @@ import {
   CircleNotch,
   Cpu,
   FlowArrow,
+  HandPalm,
   Lightning,
   MagicWand,
   ShieldCheck,
   Sparkle,
   X,
 } from "@phosphor-icons/react";
-import { Bezel, Eyebrow, SevChip, StatusChip, timeAgo, motion as m } from "../components/primitives";
+import { Bezel, PageHead, SevChip, StatusChip, motion as m, timeAgo } from "../components/primitives";
 import { loadSituations, loadSituationDetail, decideApproval, loadMetrics, loadOutcomes, draftAsync } from "../data/source";
+import { OPERATOR_NAME } from "../data/api";
 import { useLiveData } from "../hooks/useLiveData";
 import { pushToast } from "../hooks/useToast";
 import type { View } from "../components/Shell";
@@ -30,6 +32,42 @@ const stageDefs = [
 
 const order: SituationStatus[] = ["detected", "diagnosed", "acting", "resolved"];
 
+/** What actually happened, per reason. The old copy claimed "gate failed closed
+ *  - nothing executed" for every failure, which is false for a rollback (a fix
+ *  ran and was undone) and dangerously false for an interrupted attempt, where
+ *  the whole point is that we do NOT know whether the cluster was changed. */
+function failureNote(reason: string | undefined): string {
+  if (!reason) return "no outcome detail recorded";
+  if (reason === "unhealthy:rolled-back")
+    return "the fix ran, health did not recover, and it was rolled back";
+  if (reason === "unhealthy:no-rollback")
+    return "the fix ran and health did not recover; the playbook has no rollback, so a human must check";
+  if (reason === "unhealthy:rollback-failed")
+    return "the fix ran, health did not recover, and the rollback itself FAILED — a human must check";
+  if (reason.startsWith("interrupted:"))
+    return "the attempt was interrupted mid-flight — whether the cluster changed is UNKNOWN, so a human must check";
+  if (reason === "aborted:timeout")
+    return "nobody decided inside the approval window — the gate refused rather than guess";
+  if (reason === "aborted:rejected") return "a human rejected this fix — nothing executed";
+  if (reason.startsWith("denied:")) return "RBAC denied the execution — nothing executed";
+  if (reason.startsWith("refused:")) return "the playbook is not reversible, so the gate refused it";
+  if (reason.startsWith("preflight")) return "the sandbox rehearsal failed, so it was never applied for real";
+  if (reason.startsWith("skipped:")) return "the gate skipped this — nothing executed";
+  return "gate failed closed — nothing executed";
+}
+
+/** A reliably-fixed signature: remediated without paging a human, still audited. */
+function QuietChip() {
+  return (
+    <span
+      className="rounded-md border border-line px-1.5 py-0.5 font-mono text-2xs text-ink-3"
+      title="This signature has been fixed reliably before. If its playbook's real track record qualifies, it runs without an approval request; either way the decision is in the audit log."
+    >
+      quiet
+    </span>
+  );
+}
+
 const METRIC_DOCS: Record<string, { title: string; formula: string; meaning: string }> = {
   noise: {
     title: "Noise reduction",
@@ -44,12 +82,12 @@ const METRIC_DOCS: Record<string, { title: string; formula: string; meaning: str
   auto: {
     title: "Auto-remediated",
     meaning: "Share of fixes that ran automatically, because the playbook had earned autonomy (≥3 clean successes).",
-    formula: "auto-mode outcomes ÷ all outcomes",
+    formula: "auto-mode outcomes ÷ attempted remediations (escalations excluded)",
   },
   success: {
     title: "Success rate",
     meaning: "Share of remediations that verified healthy afterward.",
-    formula: "successful outcomes ÷ all outcomes",
+    formula: "successful outcomes ÷ attempted remediations (escalations excluded)",
   },
 };
 
@@ -90,7 +128,7 @@ function MetricCard({
   const d = METRIC_DOCS[docKey];
   return (
     <button onClick={() => setOpen((o) => !o)} className="block w-full text-left">
-      <div className="rounded-2xl border border-black/[0.06] bg-black/[0.02] p-4 transition-colors hover:bg-black/[0.04]">
+      <div className="rounded-lg border border-line bg-surface p-4 transition-colors hover:bg-surface-2">
         <div className="flex items-center justify-between">
           <span className="text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">{d.title}</span>
           <span className="font-mono text-2xs text-ink-4">{open ? "−" : "?"}</span>
@@ -98,7 +136,7 @@ function MetricCard({
         <div className="mt-1 text-2xl font-semibold tracking-tightest tnum">{value}</div>
         <div className="font-mono text-2xs text-ink-3">{sub}</div>
         {open && (
-          <div className="mt-3 border-t border-black/[0.06] pt-3">
+          <div className="mt-3 border-t border-line pt-3">
             <p className="text-2xs leading-relaxed text-ink-2">{d.meaning}</p>
             <p className="mt-1.5 font-mono text-2xs text-ink-3">= {d.formula}</p>
           </div>
@@ -118,12 +156,13 @@ export function Incidents({
   const { data: seed } = useLiveData(loadSituations, [] as Situation[]);
   const { data: metrics } = useLiveData(loadMetrics, {
     alertsIngested: 0, situationsOpen: 0, noiseReductionPct: 0, mttrMinutes: 0,
-    autoRemediatedPct: 0, suppressedToday: 0, approvalsPending: 0, successRate: 0,
+    autoRemediatedPct: 0, suppressedToday: 0, approvalsPending: 0, successRate: 0, needsAttention: 0,
   } as Metrics);
   const { data: recentOutcomes } = useLiveData(loadOutcomes, [] as OutcomeRow[]);
   const [overrides, setOverrides] = useState<Record<string, Partial<Situation>>>({});
   const [selId, setSelId] = useState<string | null>(null);
   const [working, setWorking] = useState(false);
+  const [pending, setPending] = useState<{ id: string; kind: "approve" | "reject" } | null>(null);
   const [proposing, setProposing] = useState(false);
 
   // merge server data with local optimistic overrides, but let server truth win:
@@ -134,7 +173,7 @@ export function Incidents({
         const o = overrides[s.id];
         if (!o) return s;
         // server reached a terminal state → discard the optimistic flip
-        if (s.status === "resolved" || s.status === "failed") return s;
+        if (s.status === "resolved" || s.status === "failed" || s.status === "needs_attention") return s;
         return { ...s, ...o };
       }),
     [seed, overrides],
@@ -148,7 +187,7 @@ export function Incidents({
       let changed = false;
       for (const [id, patch] of Object.entries(o)) {
         const srv = seed.find((s) => s.id === id);
-        if (srv && (srv.status === "resolved" || srv.status === "failed")) {
+        if (srv && (srv.status === "resolved" || srv.status === "failed" || srv.status === "needs_attention")) {
           changed = true; // drop it — server is terminal
         } else {
           next[id] = patch;
@@ -157,6 +196,16 @@ export function Incidents({
       return changed ? next : o;
     });
   }, [seed]);
+
+  // The decision is only finished when the SERVER says so. Clearing it on the
+  // POST response would re-offer the gate while remediation is still running.
+  useEffect(() => {
+    if (!pending) return;
+    const srv = seed.find((x) => x.id === pending.id);
+    if (srv && (srv.status === "resolved" || srv.status === "failed" || srv.status === "needs_attention")) {
+      setPending(null);
+    }
+  }, [seed, pending]);
 
   // keep a valid selection as data streams in
   useEffect(() => {
@@ -180,9 +229,17 @@ export function Incidents({
     setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }));
   }
 
+  // A decision that has been SENT but whose outcome has not arrived. Tracked
+  // explicitly rather than smuggled through `status`: the POST returning 200
+  // means "the decision was recorded", not "remediation finished", and a reject
+  // is not a terminal state until the server says so.
+  const decisionSent = sel && pending?.id === sel.id ? pending.kind : null;
+  const gateBusy = working || decisionSent !== null;
+
   async function approve() {
-    if (working || !sel) return;
+    if (gateBusy || !sel) return;
     setWorking(true);
+    setPending({ id: sel.id, kind: "approve" });
     update(sel.id, { status: "acting" }); // transient: "awaiting outcome"
     try {
       await decideApproval(`appr-${sel.id}`, "approved");
@@ -208,6 +265,7 @@ export function Incidents({
     } catch (e) {
       pushToast("error", `Approval failed: ${e instanceof Error ? e.message : "unknown"}`);
       update(sel.id, { status: "diagnosed" }); // roll the optimistic flip back
+      setPending(null); // the decision never landed - re-offer the gate
     } finally {
       setWorking(false);
     }
@@ -217,7 +275,7 @@ export function Incidents({
     if (proposing || !sel) return;
     setProposing(true);
     try {
-      const { run_id } = await draftAsync(sel, "oncall-alice");
+      const { run_id } = await draftAsync(sel, OPERATOR_NAME);
       pushToast("success", "Drafting… see Agent Activity");
       onFocusRun?.(run_id);
       onView?.("agent-activity");
@@ -229,9 +287,12 @@ export function Incidents({
   }
 
   async function reject() {
-    if (working || !sel) return;
+    if (gateBusy || !sel) return;
     setWorking(true);
-    update(sel.id, { status: "failed" });
+    setPending({ id: sel.id, kind: "reject" });
+    // Deliberately NOT an optimistic terminal status: painting "No action taken"
+    // before the server confirms would show a finished state for a decision that
+    // may still fail, and would contradict itself a second later.
     try {
       await decideApproval(`appr-${sel.id}`, "rejected");
       pushToast("success", "Rejected — no action taken");
@@ -244,12 +305,15 @@ export function Incidents({
     } catch (e) {
       pushToast("error", `Reject failed: ${e instanceof Error ? e.message : "unknown"}`);
       update(sel.id, { status: "diagnosed" });
+      setPending(null);
     } finally {
       setWorking(false);
     }
   }
 
-  const stageIndex = shown ? order.indexOf(shown.status === "failed" ? "acting" : shown.status) : 0;
+  const stageIndex = shown
+    ? order.indexOf(shown.status === "failed" || shown.status === "needs_attention" ? "acting" : shown.status)
+    : 0;
 
   return (
     <div className="space-y-5">
@@ -257,19 +321,19 @@ export function Incidents({
         <MetricCard docKey="noise" value={`${metrics.noiseReductionPct}%`} sub={`${metrics.alertsIngested.toLocaleString()} alerts → ${metrics.situationsOpen} open`} />
         <MetricCard docKey="mttr" value={metrics.mttrMinutes > 0 ? `${metrics.mttrMinutes}m` : "—"} sub={metrics.mttrMinutes > 0 ? "mean time to resolve" : "no fixes yet"} />
         <MetricCard docKey="auto" value={`${metrics.autoRemediatedPct}%`} sub="ran without a human" />
-        <MetricCard docKey="success" value={`${Math.round(metrics.successRate * 100)}%`} sub="verified healthy" />
+        <MetricCard docKey="success" value={`${Math.round(metrics.successRate * 100)}%`} sub={metrics.needsAttention > 0 ? `${metrics.needsAttention} escalated · needs a human` : "verified healthy"} />
       </div>
 
-      <div>
-        <Eyebrow>
-          <span className="h-1.5 w-1.5 animate-beat rounded-full bg-sev-warn" /> Incident workspace · on-call
-        </Eyebrow>
-        <h1 className="mt-4 text-4xl font-semibold tracking-tightest sm:text-5xl">Situations, not alerts.</h1>
-        <p className="mt-3 max-w-[56ch] text-base leading-relaxed text-ink-2">
-          Each row is an entire alert storm collapsed to one working incident. Open one to walk the pipeline
-          and clear the approval gate.
-        </p>
-      </div>
+      <PageHead
+        title="Incidents"
+        hint="One row per incident, not per alert. Open one to follow the pipeline from the signals that fired to the fix and its verification."
+        right={
+          <span className="flex items-center gap-2 font-mono text-2xs text-ink-3">
+            <span className="h-1.5 w-1.5 animate-beat rounded-full bg-sev-warn" />
+            on-call workspace
+          </span>
+        }
+      />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* queue */}
@@ -284,15 +348,18 @@ export function Incidents({
               return (
                 <button key={s.id} onClick={() => setSelId(s.id)} className="block w-full text-left">
                   <div
-                    className={`rounded-4xl p-1.5 transition-all duration-500 ease-fluid ${
-                      active ? "border border-signal/40 bg-signal/[0.06] shadow-glow" : "border border-black/[0.06] bg-black/[0.02] hover:bg-black/[0.04]"
+                    className={`rounded-xl border p-4 transition-colors duration-200 ${
+                      active
+                        ? "border-signal/50 bg-signal/[0.06]"
+                        : "border-line-strong bg-ground-raised hover:border-ink-4"
                     }`}
                   >
-                    <div className="rounded-[calc(2rem-6px)] bg-ground-sunken p-4">
+                    <div>
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex items-center gap-2">
                           <SevChip sev={s.severity} />
                           <StatusChip status={s.status} />
+                          {s.handling === "quiet" && <QuietChip />}
                         </div>
                         <span className="font-mono text-2xs text-ink-3">{timeAgo(s.first_seen)}</span>
                       </div>
@@ -317,8 +384,11 @@ export function Incidents({
         {/* detail */}
         {sel && shown ? (
         <div className="lg:col-span-7">
-          <AnimatePresence mode="wait">
-            <m.div key={sel.id} initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: 0.4, ease: [0.32, 0.72, 0, 1] }}>
+          {/* Not mode="wait": that held the column empty for the exit AND the
+              enter - ~800ms of nothing on every incident click. Concurrent, and
+              faster, so selection feels instant. */}
+          <AnimatePresence initial={false}>
+            <m.div key={sel.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.18, ease: [0.32, 0.72, 0, 1] }}>
               <Bezel coreClassName="p-6">
                 {/* header */}
                 <div className="flex flex-wrap items-start justify-between gap-3">
@@ -326,6 +396,7 @@ export function Incidents({
                     <div className="flex items-center gap-2">
                       <SevChip sev={shown.severity} />
                       <StatusChip status={shown.status} />
+                      {shown.handling === "quiet" && <QuietChip />}
                     </div>
                     <h2 className="mt-3 text-2xl font-semibold tracking-tight">{shown.title}</h2>
                     <div className="mt-1.5 flex items-center gap-3 font-mono text-2xs text-ink-3">
@@ -334,22 +405,26 @@ export function Incidents({
                       <span>· {shown.memberCount} alerts collapsed</span>
                     </div>
                   </div>
-                  <div className="flex items-center gap-1.5 rounded-full border border-black/[0.08] bg-black/[0.03] px-3 py-1.5 font-mono text-2xs text-ink-2">
+                  <div className="flex items-center gap-1.5 rounded-full border border-line-strong bg-surface-2 px-3 py-1.5 font-mono text-2xs text-ink-2">
                     <Cpu size={14} weight="light" /> {shown.service}
                   </div>
                 </div>
 
                 {/* pipeline rail */}
-                <div className="mt-6 rounded-2xl border border-black/[0.06] bg-black/[0.02] p-4">
+                <div className="mt-6 rounded-lg border border-line bg-surface p-4">
                   <div className="space-y-1.5">
                     {stageDefs.map((st, i) => {
                       const done = i < stageIndex;
-                      const now = i === stageIndex && shown.status !== "resolved" && shown.status !== "failed";
+                      const now =
+                        i === stageIndex &&
+                        shown.status !== "resolved" &&
+                        shown.status !== "failed" &&
+                        shown.status !== "needs_attention";
                       const doneAll = shown.status === "resolved";
                       const isDone = done || doneAll;
                       return (
                         <div key={st.key} className={`flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors duration-500 ${now ? "bg-signal/[0.07]" : ""}`}>
-                          <span className={`flex h-7 w-7 flex-none items-center justify-center rounded-lg ${isDone ? "bg-sev-ok/15 text-sev-ok" : now ? "bg-signal/15 text-signal" : "bg-black/[0.05] text-ink-3"}`}>
+                          <span className={`flex h-7 w-7 flex-none items-center justify-center rounded-lg ${isDone ? "bg-sev-ok/15 text-sev-ok" : now ? "bg-signal/15 text-signal" : "bg-surface-2 text-ink-3"}`}>
                             {isDone ? <Check size={14} weight="bold" /> : now && working ? <CircleNotch size={14} weight="bold" className="animate-spin" /> : st.icon}
                           </span>
                           <div className="min-w-0">
@@ -377,14 +452,14 @@ export function Incidents({
                       {shown.member_events.slice(0, 6).map((ev, i) => {
                         const b = shown.baseline?.[ev.name];
                         return (
-                          <div key={i} className="flex items-center gap-3 rounded-lg bg-black/[0.02] px-3 py-1.5 font-mono text-2xs">
+                          <div key={i} className="flex items-center gap-3 rounded-lg bg-surface px-3 py-1.5 font-mono text-2xs">
                             <span className="text-ink">{ev.name}</span>
                             <span className="text-signal-dim">{ev.value ?? "—"}</span>
                             {b && <span className="text-ink-3">vs baseline {fmtBaseline(b.mean)}±{fmtBaseline(b.std)}</span>}
                             {shown.peak_score != null && i === 0 && <span className="text-sev-warn">z ≈ {shown.peak_score.toFixed(1)}</span>}
                             {ev.kind_detected && (
                               <span
-                                className="ml-auto rounded bg-black/[0.05] px-1.5 py-0.5 text-ink-3"
+                                className="ml-auto rounded bg-surface-2 px-1.5 py-0.5 text-ink-3"
                                 title={DETECTION_KIND_DOC[ev.kind_detected]}
                               >
                                 {DETECTION_KIND_LABEL[ev.kind_detected]}
@@ -405,7 +480,7 @@ export function Incidents({
                   </div>
                   <div className="space-y-2">
                     {shown.hypotheses.map((h, i) => (
-                      <div key={i} className={`rounded-xl border p-3 ${i === 0 ? "border-signal/25 bg-signal/[0.05]" : "border-black/[0.06] bg-black/[0.02]"}`}>
+                      <div key={i} className={`rounded-xl border p-3 ${i === 0 ? "border-signal/25 bg-signal/[0.05]" : "border-line bg-surface"}`}>
                         <div className="flex items-center justify-between gap-3">
                           <span className="text-sm text-ink-2">{h.description}</span>
                           <span className="flex flex-none items-center gap-1.5 font-mono text-2xs text-ink-3">
@@ -418,7 +493,7 @@ export function Incidents({
                               </span>
                             ) : h.confidence_source === "rule" ? (
                               <span
-                                className="rounded bg-black/[0.05] px-1.5 py-0.5 text-ink-3"
+                                className="rounded bg-surface-2 px-1.5 py-0.5 text-ink-3"
                                 title="Confidence is the deterministic rule fallback (no embedding selector active for this candidate)."
                               >
                                 rule
@@ -428,10 +503,10 @@ export function Incidents({
                           </span>
                         </div>
                         <div className="mt-2 flex items-center gap-2">
-                          <div className="h-1 flex-1 overflow-hidden rounded-full bg-black/[0.08]">
+                          <div className="h-1 flex-1 overflow-hidden rounded-full bg-surface-3">
                             <div className={`h-full rounded-full ${i === 0 ? "bg-signal" : "bg-ink-4"}`} style={{ width: `${h.confidence * 100}%` }} />
                           </div>
-                          {h.suggested_runbook_id && <span className="rounded-md bg-black/[0.05] px-2 py-0.5 font-mono text-2xs text-ink-2">{h.suggested_runbook_id}</span>}
+                          {h.suggested_runbook_id && <span className="rounded-md bg-surface-2 px-2 py-0.5 font-mono text-2xs text-ink-2">{h.suggested_runbook_id}</span>}
                         </div>
                         {h.evidence && h.evidence.length > 0 && (
                           <ul className="mt-2 space-y-0.5">
@@ -441,7 +516,7 @@ export function Incidents({
                           </ul>
                         )}
                         {i === 0 && h.explanation && (
-                          <div className="mt-2 rounded-lg bg-black/[0.03] p-2 text-2xs leading-relaxed text-ink-2">
+                          <div className="mt-2 rounded-lg bg-surface-2 p-2 text-2xs leading-relaxed text-ink-2">
                             <span className="font-mono text-ink-3">
                               {h.explanation_source === "llm"
                                 ? "AI explanation"
@@ -458,14 +533,19 @@ export function Incidents({
                 </div>
 
                 {/* the gate / result */}
-                <div className="mt-5 rounded-2xl border border-black/[0.06] bg-black/[0.03] p-4">
+                <div className="mt-5 rounded-lg border border-line bg-surface-2 p-4">
                   {shown.status === "resolved" ? (
                     <div className="flex items-start gap-3">
                       <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-full bg-sev-ok/15 text-sev-ok"><Check size={17} weight="bold" /></span>
                       <div>
                         <div className="text-sm font-medium text-ink">
                           Resolved · <span className="font-mono text-sev-ok">{shown.outcome?.health_after ?? "resolved"}</span>
-                          {shown.outcome?.mode === "dry_run" && <span className="ml-2 rounded-md bg-black/[0.05] px-1.5 py-0.5 font-mono text-2xs text-ink-3">dry-run</span>}
+                          {shown.outcome?.mode === "dry_run" && <span className="ml-2 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-2xs text-ink-3">dry-run</span>}
+                          {shown.outcome?.handling === "quiet" && (
+                            <span className="ml-2 rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-2xs text-ink-3">
+                              handled quietly · no approval needed (proven fix, audited)
+                            </span>
+                          )}
                         </div>
                         {shown.outcome?.steps && shown.outcome.steps.length > 0 && (
                           <div className="mt-1 font-mono text-2xs text-ink-3">steps: {shown.outcome.steps.join(" → ")}</div>
@@ -510,7 +590,31 @@ export function Incidents({
                             ✗ still anomalous after fix: <span className="text-sev-warn">{metricNames(shown).join(", ")}</span> → rolled back
                           </div>
                         )}
-                        <div className="font-mono text-2xs text-ink-3">gate failed closed — nothing executed</div>
+                        <div className="font-mono text-2xs text-ink-3">{failureNote(shown.outcome?.health_after)}</div>
+                      </div>
+                    </div>
+                  ) : shown.status === "needs_attention" ? (
+                    <div className="flex items-start gap-3">
+                      <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-full bg-sev-attention/15 text-sev-attention"><HandPalm size={17} weight="fill" /></span>
+                      <div>
+                        <div className="text-sm font-medium text-ink">
+                          Needs attention · <span className="font-mono text-sev-attention">{shown.outcome?.health_after ?? "escalated"}</span>
+                        </div>
+                        <p className="mt-1.5 font-mono text-2xs text-ink-3">
+                          No automated fix was attempted — the system had no candidate runbook for this
+                          situation. <span className="text-ink-2">Nothing was executed, and this is not a failed
+                          remediation</span>: it is excluded from the success rate. A human decides what happens next.
+                        </p>
+                        <div className="mt-3 flex gap-2">
+                          <button
+                            onClick={draftWithAI}
+                            disabled={proposing}
+                            className="group flex items-center gap-2 rounded-full bg-signal px-5 py-2.5 text-sm font-medium text-white transition-all duration-300 ease-fluid active:scale-[0.97] disabled:opacity-50"
+                          >
+                            {proposing ? <CircleNotch size={15} weight="bold" className="animate-spin" /> : <Sparkle size={15} weight="light" />}
+                            {proposing ? "Drafting…" : "Draft a runbook with AI"}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ) : shown.hitl_mode === "auto" ? (
@@ -543,20 +647,40 @@ export function Incidents({
                         </button>
                       </div>
                     </div>
+                  ) : decisionSent !== null || shown.status === "acting" ? (
+                    <div className="flex items-start gap-3">
+                      <span className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-full bg-signal/15 text-signal">
+                        <CircleNotch size={17} weight="bold" className="animate-spin" />
+                      </span>
+                      <div>
+                        <div className="text-sm font-medium text-ink">
+                          {decisionSent === "reject" ? (
+                            <>Rejecting — holding this incident</>
+                          ) : (
+                            <>Remediating · <span className="font-mono text-signal">{shown.suggested_runbook_id}</span></>
+                          )}
+                        </div>
+                        <p className="mt-1.5 font-mono text-2xs text-ink-3">
+                          {decisionSent === "reject"
+                            ? "Decision recorded. Waiting for action-service to confirm nothing was executed."
+                            : "Decision recorded. action-service is executing the playbook and will verify health before declaring it resolved."}
+                        </p>
+                      </div>
+                    </div>
                   ) : (
                     <div>
                       <div className="flex items-center gap-2">
                         <span className="flex h-2 w-2 animate-beat rounded-full bg-sev-warn" />
                         <span className="text-sm font-medium text-ink">Human approval required</span>
-                        <span className="ml-auto rounded-md bg-black/[0.05] px-2 py-0.5 font-mono text-2xs text-ink-2">{shown.suggested_runbook_id} · hitl</span>
+                        <span className="ml-auto rounded-md bg-surface-2 px-2 py-0.5 font-mono text-2xs text-ink-2">{shown.suggested_runbook_id} · hitl</span>
                       </div>
                       <p className="mt-1.5 font-mono text-2xs text-ink-3">action-service is authorized to <span className="text-ink-2">execute</span> this reversible playbook. Approve to run it, or reject to hold.</p>
                       <div className="mt-3 flex gap-2">
-                        <button onClick={approve} disabled={working} className="group flex items-center gap-2 rounded-full bg-signal px-5 py-2.5 text-sm font-medium text-white transition-all duration-300 ease-fluid active:scale-[0.97] disabled:opacity-50">
-                          {working ? <CircleNotch size={15} weight="bold" className="animate-spin" /> : <Check size={15} weight="bold" />}
-                          {working ? "Executing…" : "Approve & remediate"}
+                        <button onClick={approve} disabled={gateBusy} className="group flex items-center gap-2 rounded-full bg-signal px-5 py-2.5 text-sm font-medium text-white transition-all duration-300 ease-fluid active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50">
+                          {gateBusy ? <CircleNotch size={15} weight="bold" className="animate-spin" /> : <Check size={15} weight="bold" />}
+                          {gateBusy ? "Approving…" : "Approve & remediate"}
                         </button>
-                        <button onClick={reject} disabled={working} className="flex items-center gap-2 rounded-full border border-black/[0.10] bg-black/[0.04] px-5 py-2.5 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-black/[0.06] active:scale-[0.97]">
+                        <button onClick={reject} disabled={gateBusy} className="flex items-center gap-2 rounded-full border border-line-strong bg-surface-2 px-5 py-2.5 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-surface-3 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface-2">
                           <X size={15} weight="bold" /> Reject
                         </button>
                         {!LIVE && (
@@ -573,14 +697,14 @@ export function Incidents({
           </AnimatePresence>
         </div>
         ) : (
-          <div className="lg:col-span-7 flex items-center justify-center rounded-4xl border border-black/[0.06] p-12 text-ink-3">
+          <div className="lg:col-span-7 flex items-center justify-center rounded-xl border border-line p-12 text-ink-3">
             Waiting for situations…
           </div>
         )}
       </div>
 
       {recentOutcomes.length > 0 && (
-        <div className="rounded-2xl border border-black/[0.06] bg-black/[0.02] p-4">
+        <div className="rounded-lg border border-line bg-surface p-4">
           <div className="mb-2 text-2xs font-medium uppercase tracking-[0.14em] text-ink-3">Recent outcomes</div>
           <div className="space-y-1">
             {recentOutcomes.slice(0, 5).map((o, i) => (

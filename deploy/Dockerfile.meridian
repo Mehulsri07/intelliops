@@ -13,7 +13,8 @@ RUN npm run build
 
 FROM python:3.11-slim
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
+# Pinned: :latest made every image build depend on whatever uv shipped that day.
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
 
 # Unprivileged runtime user (see deploy/Dockerfile).
 RUN useradd --uid 10001 --create-home app

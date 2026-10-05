@@ -77,7 +77,6 @@ function AnomalyMockup() {
   const max = Math.max(...base); const min = 40; const range = max - min;
   const px = (i: number) => 12 + (i / (base.length - 1)) * (W - 24);
   const py = (v: number) => 16 + (1 - (v - min) / range) * (H - 36);
-  const pts = base.map((v, i) => `${px(i)},${py(v)}`).join(" ");
   const baselineY = py(46);
 
   return (

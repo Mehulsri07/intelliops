@@ -34,9 +34,22 @@ class HitlMode(str, Enum):
 
 
 class RemediationResult(str, Enum):
+    """How a remediation ended.
+
+    ESCALATED is deliberately narrow: it means **no remediation was attempted, because
+    the system had no candidate fix** — RCA produced no runbook, or named one that does
+    not exist. It is an epistemic gap ("I don't know what to do"), not a failure, so it
+    is never evidence about any runbook and must never enter the learning loop.
+
+    Gate-blocked remediations (RBAC denied, not reversible, HITL rejected/timed out,
+    preflight failed) stay FAILURE: there the system knew exactly what to do and was not
+    permitted to, or tried it and it did not work. Both are real signal about a runbook.
+    """
+
     SUCCESS = "success"
     FAILURE = "failure"
     ROLLED_BACK = "rolled_back"
+    ESCALATED = "escalated"
 
 
 class TelemetryEvent(BaseModel):
@@ -64,6 +77,11 @@ class Situation(BaseModel):
     signature: str
     peak_score: float | None = None  # correlator max z-score for the window
     baseline: dict | None = None  # per-metric {name: {mean, std}} at emit time
+    # "quiet": correlation has seen this signature fixed reliably and asks for it
+    # to be handled without paging a human. A REQUEST, not a permission - action
+    # re-checks the evidence for the specific playbook before skipping approval,
+    # and every other safety gate still applies. Additive; defaults to "normal".
+    handling: str = "normal"  # "normal" | "quiet"
 
 
 class RootCauseHypothesis(BaseModel):
@@ -201,8 +219,11 @@ class RemediationOutcome(BaseModel):
     ts: datetime
     hitl_mode: HitlMode = HitlMode.HITL
     steps: list[str] = Field(default_factory=list)
-    mode: str = "dry_run"  # "dry_run" | "k8s"
+    mode: str = "dry_run"  # "dry_run" | "k8s" | "none" (escalated: no executor ran)
     preflight: PreflightResult | None = None
+    # "quiet" when the fix ran without a human approval on the strength of its
+    # track record (see Situation.handling). Additive; defaults to "normal".
+    handling: str = "normal"
 
 
 class AuditRecord(BaseModel):
@@ -245,6 +266,11 @@ class TrainingRecord(BaseModel):
     result: RemediationResult
     worked: bool
     ts: datetime
+    # How the remediation ran ("dry_run" | "k8s" | ...), copied from the outcome.
+    # Additive and optional: records written before it existed load as None.
+    # Graduation needs it - a simulated success is not evidence that a playbook
+    # is safe to run unattended on a real cluster.
+    mode: str | None = None
 
 
 class TraceStepKind(str, Enum):

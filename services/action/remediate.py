@@ -168,6 +168,20 @@ def _audit(gate, situation: Situation, playbook: Playbook, decision: str) -> Non
     )
 
 
+def _expire_best_effort(gate, approval_id: str) -> None:
+    """We stopped waiting; say so, or the request sits "pending" forever and the
+    console keeps offering an Approve that can no longer do anything. Best effort:
+    the outcome below is already fail-closed, and a gate without expire() (older
+    fakes) simply leaves the request as it was."""
+    expire = getattr(gate, "expire", None)
+    if expire is None:
+        return
+    try:
+        expire(approval_id, _ACTOR)
+    except Exception:  # noqa: BLE001, S110 - never let bookkeeping change the outcome
+        pass
+
+
 def execute_remediation(
     situation: Situation,
     playbook: Playbook,
@@ -177,7 +191,12 @@ def execute_remediation(
     sandbox,
     timeout_seconds: float,
     poll_interval_seconds: float,
+    skip_approval: bool = False,
 ) -> RemediationOutcome:
+    """`skip_approval` waives ONLY gate 3 (the human approval), and only for a
+    quiet situation whose playbook the caller has already checked against its
+    real track record (services/action/consumer.py). Gates 0-2.5 and the
+    pre-flight rehearsal apply exactly as they do to everything else."""
     # Gate 0: disabled playbooks never run.
     if playbook.hitl_mode == HitlMode.DISABLED:
         _audit(gate, situation, playbook, "skipped")
@@ -213,8 +232,9 @@ def execute_remediation(
     # approves (and before an auto playbook executes). Fail-safe — the sandbox
     # never raises; a failure is a PreflightResult(passed=False).
     preflight = sandbox.rehearse(situation, plan)
-    if not preflight.passed and playbook.hitl_mode == HitlMode.AUTO:
-        # Auto has no human to advise — block.
+    if not preflight.passed and (playbook.hitl_mode == HitlMode.AUTO or skip_approval):
+        # Auto has no human to advise — block. Neither does a quiet run whose
+        # approval was waived: a failed rehearsal is a hard stop for it too.
         _audit(gate, situation, playbook, "preflight-failed")
         return _outcome(
             situation,
@@ -228,7 +248,9 @@ def execute_remediation(
 
     # Gate 3: HITL — wait for an explicit human approval (ADR-008). The human
     # sees the pre-flight verdict on the request.
-    if playbook.hitl_mode == HitlMode.HITL:
+    if playbook.hitl_mode == HitlMode.HITL and skip_approval:
+        _audit(gate, situation, playbook, "quiet-approved")
+    elif playbook.hitl_mode == HitlMode.HITL:
         request = gate.request_approval(
             ApprovalRequest(
                 id=f"appr-{situation.id}",
@@ -241,6 +263,8 @@ def execute_remediation(
         decided = gate.await_decision(request.id, timeout_seconds)
         if decided.status != "approved":
             reason = "aborted:rejected" if decided.status == "rejected" else "aborted:timeout"
+            if decided.status == "pending":
+                _expire_best_effort(gate, request.id)
             _audit(gate, situation, playbook, "abort")
             return _outcome(
                 situation, playbook, RemediationResult.FAILURE, reason, preflight=preflight
@@ -272,7 +296,32 @@ def execute_remediation(
             preflight=preflight,
         )
 
-    remediator.rollback(plan)
+    # Unhealthy. Only report ROLLED_BACK when something was actually undone: a
+    # playbook with no rollback steps (restart-pod ships with none) used to be
+    # reported as rolled back when nothing ran, and a rollback that FAILED was
+    # reported the same way as one that worked.
+    if not plan.rollback_steps:
+        _audit(gate, situation, playbook, "unhealthy-no-rollback")
+        return _outcome(
+            situation,
+            playbook,
+            RemediationResult.FAILURE,
+            "unhealthy:no-rollback",
+            steps=steps,
+            mode=mode,
+            preflight=preflight,
+        )
+    if not remediator.rollback(plan):
+        _audit(gate, situation, playbook, "rollback-failed")
+        return _outcome(
+            situation,
+            playbook,
+            RemediationResult.FAILURE,
+            "unhealthy:rollback-failed",
+            steps=steps,
+            mode=mode,
+            preflight=preflight,
+        )
     _audit(gate, situation, playbook, "rolled-back")
     return _outcome(
         situation,

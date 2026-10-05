@@ -1,14 +1,60 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
-  darkMode: "class",
+  // The theme is stamped on <html> as data-theme by the pre-paint script in
+  // index.html; nothing in the app uses Tailwind's own `dark:` variant.
+  darkMode: ['selector', '[data-theme="dark"]'],
   theme: {
     extend: {
       colors: {
-        ground: { DEFAULT: "#FFFFFF", raised: "#FFFFFF", sunken: "#F5F5F7" },
-        ink: { DEFAULT: "#1D1D1F", 2: "#6E6E73", 3: "#86868B", 4: "#C7C7CC" },
-        signal: { DEFAULT: "#0071E3", dim: "#0058B0", glow: "rgba(0,113,227,0.14)" },
-        sev: { ok: "#34C759", warn: "#FF9500", crit: "#FF3B30", info: "#5E5CE6" },
+        // Every colour resolves through a CSS custom property holding RGB
+        // channels, so the same class works in both themes and Tailwind's
+        // opacity modifiers still compose (`bg-signal/12`, `border-line/40`).
+        // The values live in src/styles/index.css; this file only names them.
+        ground: {
+          DEFAULT: "rgb(var(--ground) / <alpha-value>)",
+          raised: "rgb(var(--ground-raised) / <alpha-value>)",
+          sunken: "rgb(var(--ground-sunken) / <alpha-value>)",
+        },
+        // A subtle step up from the card, for nested blocks. Replaces the
+        // `bg-white/[0.0x]` washes, which are invisible on a light ground.
+        surface: {
+          DEFAULT: "rgb(var(--surface) / <alpha-value>)",
+          2: "rgb(var(--surface-2) / <alpha-value>)",
+          3: "rgb(var(--surface-3) / <alpha-value>)",
+        },
+        // ink-3 carries most of the 11px operational detail, so each tone is
+        // set to clear WCAG AA on `raised` in BOTH themes rather than chosen
+        // by eye. scripts/check-contrast.mjs enforces it.
+        ink: {
+          DEFAULT: "rgb(var(--ink) / <alpha-value>)",
+          2: "rgb(var(--ink-2) / <alpha-value>)",
+          3: "rgb(var(--ink-3) / <alpha-value>)",
+          4: "rgb(var(--ink-4) / <alpha-value>)",
+        },
+        // Hairlines. Deliberately visible: a 1px rule doing the work is what
+        // separates a crisp UI from a soft one, and it removes the need for
+        // shadows to imply an edge.
+        line: {
+          DEFAULT: "rgb(var(--line) / <alpha-value>)",
+          strong: "rgb(var(--line-strong) / <alpha-value>)",
+        },
+        // One accent, used for text, rules, focus and the primary chart series.
+        signal: {
+          DEFAULT: "rgb(var(--signal) / <alpha-value>)",
+          dim: "rgb(var(--signal-dim) / <alpha-value>)",
+          glow: "rgb(var(--signal) / 0.14)",
+        },
+        // Five severity tones. `attention` stays distinct from warn and crit:
+        // "stopped, a human is needed" must not read as "currently
+        // remediating" or "the fix failed".
+        sev: {
+          ok: "rgb(var(--sev-ok) / <alpha-value>)",
+          warn: "rgb(var(--sev-warn) / <alpha-value>)",
+          crit: "rgb(var(--sev-crit) / <alpha-value>)",
+          info: "rgb(var(--sev-info) / <alpha-value>)",
+          attention: "rgb(var(--sev-attention) / <alpha-value>)",
+        },
       },
       fontFamily: {
         sans: ["Geist", "ui-sans-serif", "system-ui", "sans-serif"],
@@ -30,9 +76,12 @@ export default {
         spring: "cubic-bezier(0.16, 1, 0.3, 1)",
       },
       boxShadow: {
-        lift: "0 1px 2px rgba(0,0,0,0.04), 0 12px 32px -12px rgba(0,0,0,0.12)",
-        glow: "0 0 0 1px rgba(0,113,227,0.35), 0 8px 24px -8px rgba(0,113,227,0.20)",
-        inset: "inset 0 1px 0 rgba(255,255,255,0.6), inset 0 0 0 1px rgba(0,0,0,0.04)",
+        // Borders carry the edges here, so shadows only need to say "this sits
+        // slightly above the page". The previous values were tuned for a white
+        // background and were simply invisible on a dark one.
+        lift: "0 1px 2px rgba(0,0,0,0.45)",
+        glow: "0 0 0 1px rgba(82,168,255,0.45), 0 0 24px -6px rgba(82,168,255,0.25)",
+        inset: "inset 0 1px 0 rgba(255,255,255,0.035)",
       },
       keyframes: {
         beat: {

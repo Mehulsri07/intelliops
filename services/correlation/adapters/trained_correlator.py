@@ -92,6 +92,8 @@ class TrainedCorrelator(BaseCorrelator):
         super().__init__(z_threshold, warmup_samples, detection_policy=detection_policy)
         self._min_fit_samples = min_fit_samples
         self._contamination = contamination
+        self._seasonal_buckets = seasonal_buckets
+        self._window_size = window_size
         # The online path: a composed RobustCorrelator built with the same params.
         # Deliberately NOT given detection_policy: the engine decides anomaly-ness
         # using the OUTER (trained) correlator's _policy; the inner robust is used
@@ -106,6 +108,15 @@ class TrainedCorrelator(BaseCorrelator):
         # long-lived service trains on recent behavior, not the whole history.
         self._features: collections.deque[list[float]] = collections.deque(maxlen=4096)
         self._model = None  # sklearn IsolationForest once fitted, else None
+
+    def _clone_kwargs(self) -> dict:
+        return {
+            **super()._clone_kwargs(),
+            "seasonal_buckets": self._seasonal_buckets,
+            "window_size": self._window_size,
+            "min_fit_samples": self._min_fit_samples,
+            "contamination": self._contamination,
+        }
 
     # --- featurization --------------------------------------------------------
 
@@ -208,6 +219,10 @@ class TrainedCorrelator(BaseCorrelator):
 
     def correlate(self, events: list[TelemetryEvent], severity: str = "low") -> Situation:
         return self._robust.correlate(events, severity=severity)
+
+    def baseline_snapshot(self) -> dict:
+        """Delegate: the online baseline is the composed RobustCorrelator's."""
+        return self._robust.baseline_snapshot()
 
     def snapshot(self) -> list[dict]:
         # ENGINE BASELINE path: the robust windows, NOT the model artifact.

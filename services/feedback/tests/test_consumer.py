@@ -10,7 +10,14 @@ NOW = datetime(2026, 8, 13, tzinfo=UTC)
 
 def _raw_outcome(result, playbook="restart-pod"):
     o = RemediationOutcome(
-        situation_id="sit-abc", playbook_id=playbook, result=result, health_after="healthy", ts=NOW
+        situation_id="sit-abc",
+        playbook_id=playbook,
+        result=result,
+        health_after="healthy",
+        ts=NOW,
+        # Real runs: a dry-run success is not graduation evidence
+        # (see test_graduation_safety.py).
+        mode="k8s",
     )
     return {"data": o.model_dump_json()}
 
@@ -71,6 +78,22 @@ def test_consumer_no_graduation_with_rollback():
     graduated = []
     _run(bus, store, graduator=graduated.append, min_successes=3)
     assert graduated == []  # a rollback in the window disqualifies
+
+
+def test_consumer_skips_escalated_outcomes():
+    # an escalation is not evidence about any runbook: only the success is stored,
+    # even though the escalation carries a real playbook_id (genuine provenance)
+    bus = ScriptedBus(
+        [
+            _raw_outcome(RemediationResult.ESCALATED),
+            _raw_outcome(RemediationResult.SUCCESS),
+        ]
+    )
+    store = InMemoryTrainingStore()
+    _run(bus, store, graduator=lambda pid: None)
+    recs = store.read_all()
+    assert len(recs) == 1
+    assert recs[0].result == RemediationResult.SUCCESS
 
 
 def test_consumer_stops_on_stop_event():

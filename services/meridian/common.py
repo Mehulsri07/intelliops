@@ -24,7 +24,11 @@ restart-pod, weight 0.5, for what is really a pure error-rate problem). The
   - traffic_surge:       request_rate UP, cpu UP, saturation UP, queue_depth UP
   - dependency_outage:   error_rate UP, latency_p99 UP — cpu stays baseline
   - db_exhaustion:       db_pool_in_use -> db_pool_max, latency UP
-  - crash:               unhealthy=True only (detection fault, no metric moves)
+  - crash:               service_up 1 -> 0 (the process is down; nothing else moves)
+  - unknown_signal:      tls_handshake_failures UP — a metric family NO RCA rule
+                         knows, so it reaches the "root cause undetermined"
+                         fallback and escalates to a human. This is the only
+                         fault that exercises the ESCALATED path end to end.
 
 "error" and "dependency_outage" are the two scenarios that MUST leave cpu at
 CPU_HEALTHY: both are request-level failures (a bug in this service / a
@@ -48,6 +52,7 @@ from prometheus_client import (
 from pydantic import BaseModel
 
 from common.auth import require_token
+from common.telemetry import jitter, jitter_enabled
 from services.base import create_app
 
 CPU_HEALTHY = 18.0
@@ -65,6 +70,12 @@ QUEUE_DEPTH_HEALTHY = 2.0
 DB_POOL_IN_USE_HEALTHY = 3.0
 DB_POOL_MAX_HEALTHY = 20.0
 DISK_USAGE_PERCENT_HEALTHY = 35.0
+SERVICE_UP_HEALTHY = 1.0
+# An unmapped metric family, deliberately outside every rank_hypotheses token
+# (saturation/cpu/disk, latency/queue/request, db_pool, memory, error) so that a
+# fault on it has no matching runbook and must escalate to a human.
+TLS_HANDSHAKE_FAILURES_HEALTHY = 0.4
+TLS_HANDSHAKE_FAILURES_BROKEN = 47.0
 
 # Broken/target constants per metric (Task 2 fault profiles). Each is a
 # plausible "fully incident" value for that metric; `spec.magnitude` scales
@@ -81,7 +92,7 @@ DB_LATENCY_P99_MS_BROKEN = 900.0  # db_exhaustion's latency lift (its own cluste
 
 class FaultSpec(BaseModel):
     # "saturation" | "error" | "latency" | "crash" | "memory_leak" |
-    # "traffic_surge" | "dependency_outage" | "db_exhaustion"
+    # "traffic_surge" | "dependency_outage" | "db_exhaustion" | "unknown_signal"
     type: str
     magnitude: float = 1.0
     duration_seconds: float | None = None
@@ -105,6 +116,8 @@ class MeridianState:
         self.db_pool_in_use = DB_POOL_IN_USE_HEALTHY
         self.db_pool_max = DB_POOL_MAX_HEALTHY
         self.disk_usage_percent = DISK_USAGE_PERCENT_HEALTHY
+        self.service_up = SERVICE_UP_HEALTHY
+        self.tls_handshake_failures = TLS_HANDSHAKE_FAILURES_HEALTHY
 
         # Gradual-ramp bookkeeping: a fault (e.g. a future `memory_leak`
         # profile) can populate this with a descriptor and `sample(now)` will
@@ -153,8 +166,19 @@ class MeridianState:
             self.queue_depth = min(QUEUE_DEPTH_BROKEN, QUEUE_DEPTH_HEALTHY + 40.0 * spec.magnitude)
             self.cpu = CPU_BROKEN  # legacy: latency also drives cpu -> scale-service
         elif spec.type == "crash":
-            # Detection-only: no metric moves, the service is just down.
+            # The process is down. `unhealthy` is in-process bookkeeping that nothing
+            # scrapes, so it alone made this fault invisible; service_up is the gauge
+            # that actually reaches Prometheus and lets the correlator see it.
             self.unhealthy = True
+            self.service_up = 0.0
+        elif spec.type == "unknown_signal":
+            # A real anomaly in a metric family no RCA rule knows. Detected and
+            # correlated like any other, but rank_hypotheses has no token for it, so
+            # it lands in the "root cause undetermined" fallback and escalates.
+            self.tls_handshake_failures = min(
+                TLS_HANDSHAKE_FAILURES_BROKEN,
+                TLS_HANDSHAKE_FAILURES_HEALTHY + 46.0 * spec.magnitude,
+            )
         elif spec.type == "memory_leak":
             # memory_usage_mb RAMPS linearly toward a target over
             # duration_seconds (default 300s if unspecified) — a leak climbs
@@ -229,6 +253,8 @@ class MeridianState:
         self.db_pool_in_use = DB_POOL_IN_USE_HEALTHY
         self.db_pool_max = DB_POOL_MAX_HEALTHY
         self.disk_usage_percent = DISK_USAGE_PERCENT_HEALTHY
+        self.service_up = SERVICE_UP_HEALTHY
+        self.tls_handshake_failures = TLS_HANDSHAKE_FAILURES_HEALTHY
         self._ramp = None
 
 
@@ -293,24 +319,46 @@ def make_meridian_service(name: str, domain_routes=None, registry: CollectorRegi
     db_pool_max_gauge = Gauge(
         "db_pool_max", "Simulated database connection pool size", registry=effective_registry
     )
+    service_up_gauge = Gauge(
+        "service_up",
+        "1 while the service is serving, 0 when it is down",
+        registry=effective_registry,
+    )
+    tls_handshake_failures_gauge = Gauge(
+        "tls_handshake_failures",
+        "TLS handshake failures per minute - a family no runbook maps to",
+        registry=effective_registry,
+    )
     disk_usage_gauge = Gauge(
         "disk_usage_percent", "Simulated disk utilization percent", registry=effective_registry
     )
 
+    # Read once at construction: whether this deployment wants live-shaped
+    # telemetry. Off in tests, so every exact-value assertion below still holds.
+    jittering = jitter_enabled()
+
+    def publish(gauge: Gauge, metric: str, value: float) -> None:
+        gauge.set(jitter(metric, name, value) if jittering else value)
+
     @app.get("/metrics")
     def metrics() -> Response:
         state.sample(time.monotonic())
-        cpu_gauge.set(state.cpu)
-        error_gauge.set(state.error_rate)
-        request_rate_gauge.set(state.request_rate)
-        latency_p50_gauge.set(state.latency_p50_ms)
-        latency_p99_gauge.set(state.latency_p99_ms)
-        memory_usage_gauge.set(state.memory_usage_mb)
-        saturation_gauge.set(state.saturation)
-        queue_depth_gauge.set(state.queue_depth)
-        db_pool_in_use_gauge.set(state.db_pool_in_use)
+        publish(cpu_gauge, "cpu_usage", state.cpu)
+        publish(error_gauge, "meridian_error_rate", state.error_rate)
+        publish(request_rate_gauge, "request_rate", state.request_rate)
+        publish(latency_p50_gauge, "latency_p50_ms", state.latency_p50_ms)
+        publish(latency_p99_gauge, "latency_p99_ms", state.latency_p99_ms)
+        publish(memory_usage_gauge, "memory_usage_mb", state.memory_usage_mb)
+        publish(saturation_gauge, "saturation", state.saturation)
+        publish(queue_depth_gauge, "queue_depth", state.queue_depth)
+        publish(db_pool_in_use_gauge, "db_pool_in_use", state.db_pool_in_use)
+        # db_pool_max is a configured pool size, service_up is a boolean, and
+        # tls_handshake_failures drives the escalation demo. None of the three
+        # should wander, so they are set directly.
         db_pool_max_gauge.set(state.db_pool_max)
-        disk_usage_gauge.set(state.disk_usage_percent)
+        publish(disk_usage_gauge, "disk_usage_percent", state.disk_usage_percent)
+        service_up_gauge.set(state.service_up)
+        tls_handshake_failures_gauge.set(state.tls_handshake_failures)
         return Response(generate_latest(effective_registry), media_type=CONTENT_TYPE_LATEST)
 
     @app.post("/admin/fault", dependencies=[Depends(require_token)])

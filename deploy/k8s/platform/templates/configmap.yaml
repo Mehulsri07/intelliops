@@ -12,15 +12,43 @@ metadata:
     {{- include "intelliops.labels" . | nindent 4 }}
 data:
   INTELLIOPS_AUTH_MODE: {{ .Values.env.AUTH_MODE | quote }}
+  # JSON lines when the Grafana/Loki stack is on, so each record's level is a
+  # searchable label there; human-readable text otherwise.
+  INTELLIOPS_LOG_FORMAT: {{ .Values.env.LOG_FORMAT | default (ternary "json" "text" .Values.observability.enabled) | quote }}
   INTELLIOPS_STORE_BACKEND: {{ .Values.env.STORE_BACKEND | quote }}
   INTELLIOPS_BUS_BACKEND: {{ .Values.env.BUS_BACKEND | quote }}
+  # Delivery durability (issue #53) + read-model cold start (#58). All default to
+  # the historical behaviour; flip them together for an at-least-once posture.
+  INTELLIOPS_BUS_DELIVERY: {{ .Values.env.BUS_DELIVERY | quote }}
+  INTELLIOPS_BUS_DLQ_MODE: {{ .Values.env.BUS_DLQ_MODE | quote }}
+  INTELLIOPS_BUS_IDEMPOTENCY_MODE: {{ .Values.env.BUS_IDEMPOTENCY_MODE | quote }}
+  INTELLIOPS_READ_REBUILD_MODE: {{ .Values.env.READ_REBUILD_MODE | quote }}
+  INTELLIOPS_CORRELATION_GROUP_BY: {{ .Values.env.CORRELATION_GROUP_BY | quote }}
+  # How many anomalous samples a window needs before it counts as an incident.
+  INTELLIOPS_CORRELATION_MIN_EVENTS: {{ .Values.env.CORRELATION_MIN_EVENTS | default "1" | quote }}
   # The Redis Service is named plainly (see redis.yaml), NOT <release>-prefixed.
   INTELLIOPS_REDIS_URL: {{ printf "redis://redis:6379/0" | quote }}
+  # read-service asks the service that OWNS each setting for /system rather than
+  # reporting its own env as fact. Without these it falls back to local values and
+  # honestly labels them unverified - correct, but unverified.
+  INTELLIOPS_RCA_URL: {{ printf "http://rca:8000" | quote }}
   # INTELLIOPS_DATABASE_URL is NOT here — it embeds the DB password, so it lives
   # in the `postgres-credentials` Secret and reaches services via envFrom:secretRef
   # (issue #57). (It uses the psycopg v3 driver + the plain `postgres` Service host.)
   # Correlation / detection / RCA / action posture (safe by default; live overlay flips these).
   INTELLIOPS_CORRELATOR_KIND: {{ .Values.env.CORRELATOR_KIND | quote }}
+  # RobustCorrelator's per-(metric, hour-bucket) window, and how full it must be
+  # before it is allowed to score. Judging on a partly-filled window means
+  # judging against a baseline that has not yet seen the metric's normal range,
+  # which inflates z-scores; requiring a full window is what the "robust" in
+  # this correlator's name is meant to buy.
+  INTELLIOPS_CORRELATION_ROBUST_WINDOW: {{ .Values.env.CORRELATION_ROBUST_WINDOW | default "128" | quote }}
+  INTELLIOPS_CORRELATION_ROBUST_WARMUP: {{ .Values.env.CORRELATION_ROBUST_WARMUP | default "30" | quote }}
+  INTELLIOPS_CORRELATION_ROBUST_KEY_BY: {{ .Values.env.CORRELATION_ROBUST_KEY_BY | default "metric" | quote }}
+  # ADR-034: what suppression does to a reliably-fixed signature, and whether a
+  # qualifying playbook may then run without an approval request.
+  INTELLIOPS_SUPPRESSION_MODE: {{ .Values.env.SUPPRESSION_MODE | default "quiet" | quote }}
+  INTELLIOPS_QUIET_SKIP_APPROVAL: {{ .Values.env.QUIET_SKIP_APPROVAL | default "true" | quote }}
   INTELLIOPS_DETECTION_POLICY: {{ .Values.env.DETECTION_POLICY | quote }}
   INTELLIOPS_RUNBOOK_SELECTOR_MODE: {{ .Values.env.RUNBOOK_SELECTOR_MODE | quote }}
   INTELLIOPS_REMEDIATOR_MODE: {{ .Values.env.REMEDIATOR_MODE | quote }}
@@ -31,6 +59,9 @@ data:
   # (poll the query below and publish each series as a TelemetryEvent).
   INTELLIOPS_TELEMETRY_MODE: {{ .Values.env.TELEMETRY_MODE | quote }}
   INTELLIOPS_PROMETHEUS_QUERY: {{ .Values.env.PROMETHEUS_QUERY | quote }}
+  # Simulated-workload idle jitter (common/telemetry.py). Bounded well inside
+  # the correlator's z-threshold, so it cannot manufacture a false incident.
+  INTELLIOPS_TELEMETRY_JITTER: {{ .Values.env.TELEMETRY_JITTER | default "0" | quote }}
   # HITL approvals: in k8s the action + governance services are SEPARATE pods, so
   # the action gate must reach governance over HTTP (not the in-process store) or
   # the console's "Approve" (which hits the governance service) 404s.
@@ -43,6 +74,10 @@ data:
   # How long the action service waits for a human HITL decision before aborting.
   # The default 30s is too short to click Approve in the UI live — raised in values-live.
   INTELLIOPS_HITL_POLL_TIMEOUT_SECONDS: {{ .Values.env.HITL_POLL_TIMEOUT_SECONDS | quote }}
+  # Post-remediation verification deadline. MUST exceed the target's
+  # terminationGracePeriodSeconds or a successful fix is reported as a
+  # rollback (the old pod still counts toward status.replicas).
+  INTELLIOPS_HEALTH_CHECK_TIMEOUT_SECONDS: {{ .Values.env.HEALTH_CHECK_TIMEOUT_SECONDS | quote }}
   # LLM explainer endpoint/model (non-secret). The API KEY is NOT here — it is
   # injected on the rca pod via a Secret (secretKeyRef), never the configmap.
   INTELLIOPS_LLM_EXPLANATION_ENDPOINT: {{ .Values.env.LLM_EXPLANATION_ENDPOINT | quote }}

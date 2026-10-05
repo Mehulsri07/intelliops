@@ -14,7 +14,8 @@ COPY alembic/ /app/alembic/
 
 FROM python:3.11-slim AS builder-base
 
-COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
+# Pinned: :latest made every image build depend on whatever uv shipped that day.
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
 
 # Unprivileged runtime user. Numeric so k8s `runAsNonRoot` can verify it.
 RUN useradd --uid 10001 --create-home app
@@ -47,10 +48,11 @@ CMD ["sh", "-c", "uvicorn \"$SERVICE_MODULE\" --host 0.0.0.0 --port \"$PORT\""]
 FROM builder-base AS full
 RUN uv sync --frozen --no-dev --extra ml --extra k8s --no-install-project
 
-COPY --from=sources /app/ ./
-RUN mkdir -p data/rca_context .cache && chown -R app:app data .cache
-USER 10001
+# The embedding-model cache is written by the app user below, so it owns it.
+RUN mkdir .cache && chown app:app .cache
 
+# Everything from here to the source COPY depends only on the dependency set,
+# so it stays cached when project source changes. Keep the COPYs last.
 # torch is used for INFERENCE ONLY (sentence-transformers .encode for cosine fit;
 # no training/CUDA). pyproject.toml pins torch to the CPU-only PyTorch index
 # (`[tool.uv.sources]` + `[[tool.uv.index]] pytorch-cpu`), so the `uv sync` above
@@ -64,6 +66,7 @@ RUN /app/.venv/bin/python -c "import torch; assert torch.version.cuda is None an
 # NOTE: PATH isn't pointed at /app/.venv/bin until below, so invoke the venv's
 # python explicitly here (bare `python` would hit the base image's system
 # interpreter, which has none of these packages installed).
+USER 10001
 ENV HF_HOME=/app/.cache/huggingface
 ENV SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence-transformers
 RUN /app/.venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" \
@@ -73,6 +76,13 @@ RUN /app/.venv/bin/python -c "from sentence_transformers import SentenceTransfor
 # cluster). Loads straight from the cache above.
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
+
+# Source last (see above). Back to root only to lay the tree down and hand the
+# writable data dir to the app user, then drop privileges for good.
+USER root
+COPY --from=sources /app/ ./
+RUN mkdir -p data/rca_context && chown -R app:app data
+USER 10001
 
 ENV PATH="/app/.venv/bin:${PATH}"
 ENV SERVICE_MODULE=services.ingestion.app:app

@@ -72,21 +72,81 @@ else
   fi
 fi
 
+# Was this release already installed? A first install does not need the
+# rollout restart below - Helm has just created every pod from the new images.
+if helm status "$RELEASE" --namespace "$NAMESPACE" >/dev/null 2>&1; then
+  FRESH_INSTALL=0
+else
+  FRESH_INSTALL=1
+fi
+
 helm "${HELM_ARGS[@]}"
+
+# --- 3b. force the new images to actually run -------------------------------
+# The image tag never changes (:latest / :full) and the chart uses
+# imagePullPolicy: IfNotPresent, so Helm sees an identical pod spec and keeps
+# the OLD pods. Without this, re-running the script after a code change
+# rebuilds and loads images, reports success, and deploys nothing.
+if [ "$FRESH_INSTALL" = "1" ]; then
+  echo "→ Fresh install - Helm already created every pod from the new images;"
+  echo "  skipping the rollout restart (it would only double the pod churn)."
+  RESTARTED=-1
+else
+echo "→ Restarting workloads so the freshly-loaded images take effect…"
+# Listed on one line on purpose: backslash continuations in a CRLF-checked-out
+# script become an escaped CR instead of a line join.
+RESTART_TARGETS="ingestion correlation rca action governance feedback read console demo-app meridian-gateway meridian-validation meridian-aggregation meridian-reporting"
+RESTARTED=0
+for d in $RESTART_TARGETS; do
+  # Deliberately NOT silenced. The first version of this step hid its own output
+  # behind >/dev/null 2>&1 || true and then failed invisibly - the script
+  # reported success while the cluster kept running the PREVIOUS build, which is
+  # the exact failure this step exists to prevent. A restart that cannot happen
+  # has to be visible.
+  if kubectl -n "$NAMESPACE" rollout restart "deploy/$d" 2>&1 | sed 's/^/    /'; then
+    RESTARTED=$((RESTARTED + 1))
+  else
+    echo "    ! could not restart deploy/$d - it may still be running OLD code" >&2
+  fi
+done
+echo "  restarted $RESTARTED workload(s)."
+if [ "$RESTARTED" -eq 0 ]; then
+  echo "  ! NOTHING was restarted - the cluster is probably still running the" >&2
+  echo "    previous images. Re-run, or: kubectl rollout restart deploy/<name>" >&2
+fi
+fi
 
 # --- 4. wait ---------------------------------------------------------------
 echo "→ Waiting for rollouts…"
+STALLED=""
 for d in ingestion correlation rca action governance feedback read console demo-app prometheus \
          meridian-gateway meridian-validation meridian-aggregation meridian-reporting; do
-  kubectl -n "$NAMESPACE" rollout status "deploy/$d" --timeout=180s || true
+  # NOT `|| true`. The previous version hid every timeout, so a stack that
+  # never became ready still printed the success banner - the same
+  # silent-success failure as the restart step above. On a cold cluster
+  # postgres/redis/prometheus are pulled from Docker Hub, which regularly
+  # pushes dependents past 180s, so this is a real outcome operators must see.
+  if ! kubectl -n "$NAMESPACE" rollout status "deploy/$d" --timeout=300s; then
+    STALLED="$STALLED $d"
+  fi
 done
 
 # --- 5. done ---------------------------------------------------------------
 echo ""
+if [ -n "$STALLED" ]; then
+  echo "✗ These workloads did NOT become ready:$STALLED" >&2
+  echo "  The stack is NOT fully up. Inspect with:" >&2
+  echo "    kubectl -n $NAMESPACE get pods" >&2
+  echo "    kubectl -n $NAMESPACE describe deploy/<name>" >&2
+  echo "  (A cold cluster pulls postgres/redis/prometheus from Docker Hub; a" >&2
+  echo "   slow or rate-limited pull is the usual cause - re-running often works.)" >&2
+  exit 1
+fi
 echo "✓ IntelliOps is up in kind cluster '$CLUSTER'."
 echo "  Console (live UI):   http://localhost:30080"
 echo "  Read service:        http://localhost:30007"
-echo "  Prometheus/Meridian: in-cluster (add a NodePort to inspect directly)."
+echo "  Meridian gateway:    http://localhost:30808  (inject faults here)"
+echo "  Prometheus:          http://localhost:30090"
 echo ""
 echo "  Inject a fault via the demo-app / Meridian /admin/fault endpoint and watch"
 echo "  detect → diagnose → approve → real pod remediation → per-metric verify in the console."

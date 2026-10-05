@@ -20,10 +20,15 @@ from common.contracts import (
     SituationStatus,
 )
 
+# The projection's own status vocabulary: a deliberate superset of the backend
+# SituationStatus enum, because the console needs a card colour for outcomes the
+# backend state machine has no state for. Any RemediationResult missing here
+# silently falls back to "failed" in apply_outcome, so a new member MUST be added.
 _RESULT_STATUS = {
     RemediationResult.SUCCESS: "resolved",
     RemediationResult.FAILURE: "failed",
     RemediationResult.ROLLED_BACK: "failed",
+    RemediationResult.ESCALATED: "needs_attention",
 }
 
 _SEVERITY_MAP = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}
@@ -64,6 +69,11 @@ class ReadModel:
         self._subscribers: set[asyncio.Queue] = set()
         self._subs_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Guards _sits/_outcomes/_suppressed_count. Four consumer threads (one per
+        # topic) write them while request threads read and prune them; two
+        # concurrent /situations calls could both try to delete the same aged-out
+        # entry, and iterating a dict another thread is resizing raises.
+        self._lock = threading.RLock()
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Called once from the async lifespan so consumer threads can hand off."""
@@ -105,40 +115,88 @@ class ReadModel:
                 pass
 
     def apply_detected(self, s: Situation) -> None:
+        with self._lock:
+            applied = self._apply_detected(s)
+        if applied:
+            self.publish({"type": "changed"})
+
+    def _apply_detected(self, s: Situation) -> bool:
+        """Fold a detection in. False when the event is stale and was ignored.
+
+        A Situation's id is its signature, so the same incident recurring later
+        arrives under the same id. first_seen tells the occurrences apart:
+
+        - older than what we hold: a late event from an earlier occurrence (the
+          topics are consumed on separate threads, and a rebuild replays them
+          topic by topic). Applying it would roll the card back in time.
+        - newer, and the held one is finished: a new occurrence. Start clean,
+          or the new card inherits the previous run's outcome and timeline.
+        - equal: the same occurrence seen again (e.g. via its diagnosis). Never
+          move its status backwards - a detected event that lost the race to its
+          own outcome must not reopen a resolved card.
+        """
+        first_ms = _epoch_ms(s.first_seen)
         existing = self._sits.get(s.id, {})
+        if existing:
+            held_first = existing.get("first_seen", first_ms)
+            if first_ms < held_first:
+                return False
+            if first_ms > held_first and existing.get("status") in self._EVICTABLE:
+                existing = {}
+        status = s.status.value if isinstance(s.status, SituationStatus) else str(s.status)
+        if existing.get("first_seen") == first_ms and existing.get("status") not in (
+            None,
+            "detected",
+        ):
+            status = existing["status"]
         self._sits[s.id] = {
             **existing,
             "id": s.id,
             "signature": s.signature,
             "service": self._service_of(s),
             "title": s.signature,
-            "status": s.status.value if isinstance(s.status, SituationStatus) else str(s.status),
+            "status": status,
             "severity": _SEVERITY_MAP.get(s.severity, "medium"),
             "memberCount": len(s.member_events),
             "member_events": _project_events(s),
             "peak_score": s.peak_score,
             "baseline": s.baseline,
             "first_seen": _epoch_ms(s.first_seen),
+            # Required by the Situation contract. The console posts a situation
+            # back to governance for AI drafting, and without this that request
+            # is rejected 422 - the projection was not round-trippable.
+            "last_seen": _epoch_ms(s.last_seen),
             "hypotheses": existing.get("hypotheses", []),
             "suggested_runbook_id": existing.get("suggested_runbook_id"),
             "hitl_mode": existing.get("hitl_mode", "hitl"),
             "reversible": existing.get("reversible", True),
             "reliability": existing.get("reliability", 0.0),
             "suppressed": False,
+            # "quiet" = correlation asked for this to be handled without paging a
+            # human; the outcome says whether that is what actually happened.
+            "handling": getattr(s, "handling", "normal"),
             "last_activity": existing.get("last_activity", _epoch_ms(s.first_seen)),
             "stages": existing.get("stages", {}),
         }
         stages = self._sits[s.id].get("stages", {})
         stages.setdefault("detected", _epoch_ms(s.first_seen))
         self._sits[s.id]["stages"] = stages
-        self.publish({"type": "changed"})
+        return True
 
     def apply_suppressed(self, s: Situation) -> None:
-        self._suppressed_count += 1
+        with self._lock:
+            self._suppressed_count += 1
         self.publish({"type": "changed"})
 
     def apply_diagnosed(self, d: DiagnosedSituation) -> None:
-        self.apply_detected(d.situation)
+        with self._lock:
+            applied = self._apply_diagnosed(d)
+        if applied:
+            self.publish({"type": "changed"})
+
+    def _apply_diagnosed(self, d: DiagnosedSituation) -> bool:
+        if not self._apply_detected(d.situation):
+            return False
         hyps = [
             {
                 "description": h.description,
@@ -153,20 +211,29 @@ class ReadModel:
         ]
         service = self._sits[d.situation.id].get("service", "unknown")
         title = f"{hyps[0]['description']} · {service}" if hyps else d.situation.signature
-        stages = self._sits[d.situation.id].get("stages", {})
+        sit = self._sits[d.situation.id]
+        stages = sit.get("stages", {})
         stages["diagnosed"] = _epoch_ms(d.situation.last_seen)
-        self._sits[d.situation.id].update(
+        sit.update(
             {
-                "status": "diagnosed",
                 "hypotheses": hyps,
                 "suggested_runbook_id": d.suggested_runbook_id,
                 "title": title,
                 "stages": stages,
             }
         )
-        self.publish({"type": "changed"})
+        # Same no-going-backwards rule as _apply_detected: a diagnosis that
+        # arrives after its outcome must not reopen the card.
+        if sit.get("status") in (None, "detected"):
+            sit["status"] = "diagnosed"
+        return True
 
     def apply_outcome(self, o: RemediationOutcome) -> None:
+        with self._lock:
+            self._apply_outcome(o)
+        self.publish({"type": "changed"})
+
+    def _apply_outcome(self, o: RemediationOutcome) -> None:
         if o.situation_id in self._sits:
             self._sits[o.situation_id]["status"] = _RESULT_STATUS.get(o.result, "failed")
             self._sits[o.situation_id]["last_activity"] = _epoch_ms(o.ts)
@@ -184,12 +251,21 @@ class ReadModel:
                 "preflight": (
                     p.model_dump() if (p := getattr(o, "preflight", None)) is not None else None
                 ),
+                "handling": getattr(o, "handling", "normal"),
             }
         result = o.result.value if isinstance(o.result, RemediationResult) else str(o.result)
         sit = self._sits.get(o.situation_id, {})
         mttr_ms = None
         if sit and o.result == RemediationResult.SUCCESS:
-            mttr_ms = _epoch_ms(o.ts) - sit["first_seen"]
+            elapsed = _epoch_ms(o.ts) - sit["first_seen"]
+            # A Situation's id IS its signature, so a recurrence of the same
+            # incident overwrites the earlier record's `first_seen`. Replaying
+            # the stream on a read-model rebuild then pairs an OLD outcome with
+            # a NEW first_seen and the subtraction goes negative -- the console's
+            # front page read "MEAN TIME TO RESOLVE -9.54 min". A negative
+            # elapsed time is not a slow fix, it is the absence of a matching
+            # detection, so report no measurement rather than a nonsense one.
+            mttr_ms = elapsed if elapsed >= 0 else None
         self._outcomes.insert(
             0,
             {
@@ -202,13 +278,25 @@ class ReadModel:
                 "hitl_mode": o.hitl_mode.value
                 if hasattr(o.hitl_mode, "value")
                 else str(o.hitl_mode),
+                # Whether a real cluster was touched. The nested per-situation
+                # outcome already carried this, but the flat /outcomes feed - the
+                # one the console's history renders - dropped it, so "we really
+                # restarted a pod" and "we simulated it" were indistinguishable
+                # downstream. It is the whole point of the k8s posture.
+                "mode": getattr(o, "mode", "dry_run"),
+                "handling": getattr(o, "handling", "normal"),
                 "mttr_ms": mttr_ms,
             },
         )
         del self._outcomes[self._max :]
-        self.publish({"type": "changed"})
 
     _TERMINAL: ClassVar[set[str]] = {"resolved", "failed"}
+
+    # "needs_attention" is deliberately NOT terminal — the one incident that most
+    # needs a human must never vanish from the console on a TTL. It is still
+    # evictable, otherwise a fault storm matching no playbook would grow _sits
+    # past max_situations without bound.
+    _EVICTABLE: ClassVar[set[str]] = {"resolved", "failed", "needs_attention"}
 
     def _age_out(self, now_ms: int) -> None:
         # age-out terminal situations older than ttl (needs a clock)
@@ -220,13 +308,15 @@ class ReadModel:
     def _enforce_cap(self) -> None:
         # cap: if over max, evict oldest-terminal-first (never active). Pure
         # relative ordering by stored last_activity, so no clock is needed.
+        # needs_attention sorts last so it is only sacrificed once no genuinely
+        # finished situation is left to drop.
         if len(self._sits) > self._max_sits:
-            terminal = sorted(
-                (s for s in self._sits.values() if s["status"] in self._TERMINAL),
-                key=lambda s: s.get("last_activity", 0),
+            evictable = sorted(
+                (s for s in self._sits.values() if s["status"] in self._EVICTABLE),
+                key=lambda s: (s["status"] == "needs_attention", s.get("last_activity", 0)),
             )
             n_to_drop = len(self._sits) - self._max_sits
-            for s in terminal[:n_to_drop]:
+            for s in evictable[:n_to_drop]:
                 del self._sits[s["id"]]
 
     def _prune(self, now_ms: int) -> None:
@@ -234,32 +324,51 @@ class ReadModel:
         self._enforce_cap()
 
     def situations(self, now_ms: int | None = None) -> list[dict]:
-        if now_ms is not None:
-            self._prune(now_ms)
-        else:
-            self._enforce_cap()
-        return list(self._sits.values())
+        with self._lock:
+            if now_ms is not None:
+                self._prune(now_ms)
+            else:
+                self._enforce_cap()
+            return list(self._sits.values())
 
     def outcomes(self) -> list[dict]:
-        return list(self._outcomes)
+        with self._lock:
+            return list(self._outcomes)
 
     def situation(self, sid: str) -> dict | None:
-        s = self._sits.get(sid)
-        return dict(s) if s is not None else None
+        with self._lock:
+            s = self._sits.get(sid)
+            return dict(s) if s is not None else None
 
     def reset(self) -> None:
-        self._sits.clear()
-        self._outcomes.clear()
-        self._suppressed_count = 0
+        with self._lock:
+            self._sits.clear()
+            self._outcomes.clear()
+            self._suppressed_count = 0
 
-    _OPEN: ClassVar[set[str]] = {"detected", "diagnosed", "acting"}
+    # needs_attention is outstanding work, so it counts as open even though it is
+    # not in-flight. approvalsPending narrows to diagnosed/acting on its own.
+    _OPEN: ClassVar[set[str]] = {"detected", "diagnosed", "acting", "needs_attention"}
 
     def metrics(self) -> dict:
+        with self._lock:
+            return self._metrics()
+
+    def _metrics(self) -> dict:
+        # Enforce the same cap situations() does. Without this the two endpoints
+        # count different sets, and the console renders them side by side: the
+        # noise-reduction tile said "N alerts -> 3 open" while the incident list
+        # directly beneath it showed 2. Same projection, two answers.
+        self._enforce_cap()
         sits = list(self._sits.values())
         outs = self._outcomes
-        total_out = len(outs)
-        successes = sum(1 for o in outs if o["result"] == "success")
-        autos = sum(1 for o in outs if o.get("hitl_mode") == "auto")
+        # Escalations are "we never tried", so they belong in neither the numerator
+        # nor the denominator of a remediation rate — counting them as attempts
+        # would penalise the system for correctly refusing to guess.
+        attempted = [o for o in outs if o["result"] != "escalated"]
+        n_att = len(attempted)
+        successes = sum(1 for o in attempted if o["result"] == "success")
+        autos = sum(1 for o in attempted if o.get("hitl_mode") == "auto")
         mttrs = [o["mttr_ms"] for o in outs if o.get("mttr_ms") is not None]
         alerts = sum(s["memberCount"] for s in sits)
         n_sits = len(sits)
@@ -275,10 +384,13 @@ class ReadModel:
             "situationsOpen": len(open_sits),
             "noiseReductionPct": round(max(0.0, noise), 1),
             "mttrMinutes": round((sum(mttrs) / len(mttrs) / 60000), 2) if mttrs else 0.0,
-            "autoRemediatedPct": round(autos / total_out * 100, 1) if total_out else 0.0,
+            "autoRemediatedPct": round(autos / n_att * 100, 1) if n_att else 0.0,
             "suppressedToday": self._suppressed_count,
             "approvalsPending": len(pending),
-            "successRate": round(successes / total_out, 3) if total_out else 0.0,
+            "successRate": round(successes / n_att, 3) if n_att else 0.0,
+            "needsAttention": sum(1 for s in sits if s["status"] == "needs_attention"),
+            # Fixes that ran without a human being asked, on a proven track record.
+            "quietlyHandled": sum(1 for o in outs if o.get("handling") == "quiet"),
         }
 
     @staticmethod

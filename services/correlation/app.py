@@ -12,7 +12,10 @@ from sqlalchemy import text
 
 from common.config import get_settings
 from common.envelope import publish_model
+from common.evidence import real_records
+from common.idempotency import make_guard
 from common.stores import make_stores
+from common.supervise import start_supervised
 from services.base import create_app, db_ready
 from services.correlation.adapters import make_correlator
 from services.correlation.consumer import (
@@ -32,6 +35,8 @@ def run_flusher(
     stop_event: threading.Event,
     baseline_store=None,
     snapshot_period: float = 30.0,
+    training_store=None,
+    reliability_refresh_seconds: float = 60.0,
 ) -> None:
     """Periodically collapse the buffered window into a Situation.
 
@@ -52,17 +57,37 @@ def run_flusher(
     its own elapsed-time schedule tracked with time.monotonic() rather than once
     per wake. The snapshot is best-effort (_snapshot_baseline_once never raises),
     so a persistence hiccup can never crash this flusher.
+
+    It also refreshes the reliability map suppression reads, on its own
+    schedule. That map used to be loaded once at boot, so a fix that started
+    working was only recognised after a restart.
     """
-    last_snapshot = time.monotonic()
+    last_snapshot = last_refresh = time.monotonic()
     while not stop_event.wait(period_seconds):
-        emitted = engine.flush()
-        if emitted is not None:
+        for emitted in engine.flush_all():
             publish_model(bus, "situations.detected", emitted)
         _drain_suppressed(bus, engine)
         now = time.monotonic()
         if now - last_snapshot >= snapshot_period:
             _snapshot_baseline_once(engine, baseline_store)
             last_snapshot = now
+        if training_store is not None and now - last_refresh >= reliability_refresh_seconds:
+            _refresh_reliability(engine, training_store)
+            last_refresh = now
+
+
+def _training_rows(training_store) -> list[dict]:
+    """Real outcomes only (common/evidence.py): a dry run always "works", so it
+    is no evidence a signature is reliably fixed."""
+    return [r.model_dump() for r in real_records(training_store.read_all())]
+
+
+def _refresh_reliability(engine, training_store) -> None:
+    """Best-effort: a failed read keeps the current map."""
+    try:
+        engine.retrain(_training_rows(training_store))
+    except Exception as exc:  # noqa: BLE001 - refresh again next period
+        logger.warning("reliability refresh failed (keeping the current map): %s", exc)
 
 
 def _reload_baseline(engine, baseline_store, training_records: list[dict]) -> None:
@@ -103,6 +128,13 @@ async def lifespan(app: FastAPI):
     engine = CorrelationEngine(
         make_correlator(settings),
         window_seconds=settings.correlation_window_seconds,
+        group_by=settings.correlation_group_by,
+        min_events=settings.correlation_min_events,
+        # Both were settings the service never passed: the threshold was dead
+        # config and the engine always used its 0.8 default.
+        suppress_threshold=settings.reliability_suppress_threshold,
+        suppress_min_samples=settings.reliability_suppress_min_samples,
+        suppress_mode=settings.suppression_mode,
     )
     app.state.engine = engine
     # Reload-on-boot: restore the durable baseline + reliability BEFORE the
@@ -116,13 +148,15 @@ async def lifespan(app: FastAPI):
     # it must be inside the guard too.
     baseline_store = None
     model_store = None
+    training_store = None
     training_records: list[dict] = []
     try:
         stores = make_stores(settings)
         app.state.db_engine = stores.engine
         baseline_store = stores.baseline_store
         model_store = getattr(stores, "model_store", None)
-        training_records = [r.model_dump() for r in stores.training_store.read_all()]
+        training_store = stores.training_store
+        training_records = _training_rows(training_store)
     except Exception as exc:  # noqa: BLE001 — a failed boot-load just means a cold start
         logger.warning("store reload failed, starting cold: %s", exc)
     # The durable `correlation_baseline` table only understands the river z-score's
@@ -137,23 +171,27 @@ async def lifespan(app: FastAPI):
     _reload_model(engine, model_store)
     app.state.baseline_store = baseline_store
     app.state.model_store = model_store
-    thread = threading.Thread(
-        target=run_consumer, args=(app.state.bus, engine, stop_event), daemon=True
+    thread = start_supervised(
+        "correlation-consumer",
+        run_consumer,
+        stop_event,
+        (app.state.bus, engine, stop_event, make_guard(settings, app.state.bus)),
     )
-    thread.start()
-    flusher = threading.Thread(
-        target=run_flusher,
-        args=(
+    flusher = start_supervised(
+        "correlation-flusher",
+        run_flusher,
+        stop_event,
+        (
             app.state.bus,
             engine,
             settings.correlation_window_seconds,
             stop_event,
             baseline_store,
             settings.baseline_snapshot_seconds,
+            training_store,
+            settings.reliability_refresh_seconds,
         ),
-        daemon=True,
     )
-    flusher.start()
     app.state.consumer_stop = stop_event
     app.state.consumer_thread = thread
     app.state.flusher_thread = flusher
@@ -214,16 +252,58 @@ def retrain() -> dict:
 
 @app.get("/baseline")
 def baseline() -> dict:
+    """What the detector currently believes "normal" looks like.
+
+    The two correlators snapshot different shapes. RiverCorrelator carries a
+    running mean/variance/count per metric; RobustCorrelator carries the raw
+    per-(metric, hour-bucket) window and derives median/MAD from it on demand.
+
+    This endpoint only ever understood the first shape, so under `robust` -- the
+    live posture's correlator -- every row came back mean=None and
+    std=sqrt(0)=0.0, and the console's "live baselines" table rendered a
+    column of dashes beside a column of zeros. Read whichever shape the running
+    correlator actually produces, and say which statistic it is.
+    """
     settings = get_settings()
     engine = getattr(app.state, "engine", None)
     rows = engine.snapshot() if engine is not None else []
-    baselines = [
-        {
-            "metric_name": r.get("metric_name"),
-            "mean": r.get("mean"),
-            "std": (r.get("variance") or 0.0) ** 0.5,
-            "count": r.get("count"),
-        }
-        for r in rows
-    ]
-    return {"correlator_kind": settings.correlator_kind, "baselines": baselines}
+    correlator = getattr(engine, "_correlator", None)
+
+    # Decide from the correlator, not from the rows: right after a reset there
+    # are no rows, and reporting "mean/stddev" for an empty robust table is the
+    # same mislabelling in miniature. `_windows` is what the window-based
+    # correlators (robust, and trained layered over it) have and river does not.
+    if hasattr(correlator, "_windows"):
+        # Robust: pool the per-bucket sample counts, and take the statistics
+        # from the correlator's own median/MAD summary.
+        counts: dict[str, int] = {}
+        for r in rows:
+            name = r.get("metric_name")
+            counts[name] = counts.get(name, 0) + int(r.get("n") or 0)
+        summary = correlator.baseline_snapshot() if hasattr(correlator, "baseline_snapshot") else {}
+        baselines = [
+            {
+                "metric_name": name,
+                "mean": stat.get("mean"),
+                "std": stat.get("std"),
+                "count": counts.get(name),
+            }
+            for name, stat in summary.items()
+        ]
+        statistic = "median/MAD"
+    else:
+        baselines = [
+            {
+                "metric_name": r.get("metric_name"),
+                "mean": r.get("mean"),
+                "std": (r.get("variance") or 0.0) ** 0.5,
+                "count": r.get("count"),
+            }
+            for r in rows
+        ]
+        statistic = "mean/stddev"
+    return {
+        "correlator_kind": settings.correlator_kind,
+        "statistic": statistic,
+        "baselines": baselines,
+    }

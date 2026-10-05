@@ -1,27 +1,38 @@
 import { useMemo, useState } from "react";
 import { Check, LockKey, Scroll, ShieldCheck, Sparkle, UserCheck, X } from "@phosphor-icons/react";
-import { Bezel, Eyebrow, timeAgo } from "../components/primitives";
+import { Bezel, PageHead, timeAgo } from "../components/primitives";
 import { approveProposal, loadAudit, loadOutcomes, loadPlaybooks, loadProposals, rejectProposal } from "../data/source";
+import { OPERATOR_NAME } from "../data/api";
 import { useLiveData } from "../hooks/useLiveData";
 import { pushToast } from "../hooks/useToast";
 import { Reveal as Section } from "../hooks/useReveal";
+import { isGraduated } from "../data/types";
 import type { AuditRow, OutcomeRow, Playbook, ProposedPlaybook } from "../data/types";
+
+/** Only `allow` is green. Anything unrecognised is neutral, never a false OK. */
+function decisionTone(decision: string): string {
+  if (decision === "allow") return "text-sev-ok";
+  if (decision === "deny") return "text-sev-crit";
+  if (decision === "pending") return "text-sev-warn";
+  if (decision === "escalated") return "text-sev-attention";
+  return "text-ink-2";
+}
 
 const gates = [
   {
-    tone: "text-sev-crit", bg: "bg-sev-crit", icon: <LockKey size={20} weight="light" />,
+    tone: "text-sev-crit", bg: "bg-sev-crit/12", icon: <LockKey size={20} weight="light" />,
     title: "RBAC, fail-closed", adr: "ADR-003",
     body: "No execution without a governance allow. An unreachable or denying gate means no action — even approval decisions are RBAC-checked.",
     reason: "denied:rbac",
   },
   {
-    tone: "text-sev-warn", bg: "bg-sev-warn", icon: <ShieldCheck size={20} weight="light" />,
+    tone: "text-sev-warn", bg: "bg-sev-warn/12", icon: <ShieldCheck size={20} weight="light" />,
     title: "Reversible-only", adr: "ADR-007",
     body: "A playbook with no rollback path is refused for auto-execution. Health is verified after acting; unhealthy self-heals by rolling back.",
     reason: "refused:not-reversible",
   },
   {
-    tone: "text-signal", bg: "bg-signal", icon: <UserCheck size={20} weight="light" />,
+    tone: "text-signal", bg: "bg-signal/12", icon: <UserCheck size={20} weight="light" />,
     title: "Human-in-the-loop", adr: "ADR-008",
     body: "A hitl playbook waits for an explicit approval. Reject or timeout means no action. Autonomy is earned on a spotless evidence trail.",
     reason: "aborted:timeout",
@@ -51,7 +62,7 @@ export function Governance() {
   async function decide(proposal: ProposedPlaybook, decision: "approved" | "rejected") {
     if (decidingId) return;
     setDecidingId(proposal.id);
-    const decidedBy = "oncall-alice";
+    const decidedBy = OPERATOR_NAME;
     try {
       const updated =
         decision === "approved"
@@ -97,33 +108,35 @@ export function Governance() {
   return (
     <div className="space-y-6">
       <Section>
-        <Eyebrow>
-          <ShieldCheck size={12} weight="light" /> Center of Excellence · control plane
-        </Eyebrow>
-        <h1 className="mt-4 text-4xl font-semibold tracking-tightest sm:text-5xl">
-          Autonomy you can <span className="text-signal">defend to an auditor.</span>
-        </h1>
-        <p className="mt-3 max-w-[58ch] text-base leading-relaxed text-ink-2">
-          Nothing touches production without passing three gates enforced in the call graph — not by
-          convention. Every decision, executed or not, is recorded immutably.
-        </p>
+        <PageHead
+          title="Governance"
+          hint="Three gates every remediation passes before it runs: RBAC, reversible actions only, and a human approval. The pass and block counts below are read from the audit record."
+          right={
+            <span className="flex items-center gap-2 font-mono text-2xs text-ink-3">
+              <ShieldCheck size={13} weight="light" />
+              enforced in the call graph
+            </span>
+          }
+        />
       </Section>
 
       {/* the three gates */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         {gates.map((g, i) => (
           <Section key={i}>
-            <div className="group relative h-full overflow-hidden rounded-4xl border border-black/[0.06] bg-black/[0.02] p-1.5 transition-transform duration-500 ease-fluid hover:-translate-y-1">
-              <span className={`absolute left-1.5 top-6 h-14 w-[3px] rounded-full ${g.bg}`} />
-              <div className="rounded-[calc(2rem-6px)] p-6 pl-7">
-                <span className={`flex h-11 w-11 items-center justify-center rounded-2xl bg-black/[0.05] ${g.tone}`}>{g.icon}</span>
+            {/* No left-edge accent stripe. It was the only thing carrying each
+                gate's colour, and an edge stripe on a card is filler; the tinted
+                icon does the same job and is where the eye already goes. */}
+            <div className="group h-full rounded-xl border border-line-strong bg-ground-raised p-6 transition-colors duration-200 hover:border-ink-4">
+              <div>
+                <span className={`flex h-10 w-10 items-center justify-center rounded-lg ${g.bg} ${g.tone}`}>{g.icon}</span>
                 <div className="mt-4 flex items-center gap-2">
                   <h3 className="text-lg font-semibold tracking-tight">{g.title}</h3>
                   <span className="font-mono text-2xs text-ink-3">{g.adr}</span>
                 </div>
                 <p className="mt-2 text-sm leading-relaxed text-ink-2">{g.body}</p>
                 <div className={`mt-4 font-mono text-2xs ${g.tone}`}>→ {g.reason}</div>
-                <div className="mt-3 flex items-center gap-3 border-t border-black/[0.06] pt-3 font-mono text-2xs text-ink-3">
+                <div className="mt-3 flex items-center gap-3 border-t border-line pt-3 font-mono text-2xs text-ink-3">
                   <span className="text-sev-ok">✓ {gateStats[g.reason]?.passed ?? 0} passed</span>
                   <span className={g.tone}>✗ {gateStats[g.reason]?.blocked ?? 0} blocked</span>
                   {gateStats[g.reason]?.lastTs ? (
@@ -150,14 +163,14 @@ export function Governance() {
           </div>
 
           {pendingProposals.length === 0 ? (
-            <div className="rounded-2xl border border-black/[0.06] p-8 text-center text-ink-3">
+            <div className="rounded-lg border border-line p-8 text-center text-ink-3">
               No proposals waiting. A drafted runbook appears here after someone clicks{" "}
               <span className="text-ink-2">Draft a runbook with AI</span> on an incident.
             </div>
           ) : (
             <div className="space-y-3">
               {pendingProposals.map((p) => (
-                <div key={p.id} className="rounded-2xl border border-signal/20 bg-signal/[0.04] p-4">
+                <div key={p.id} className="rounded-lg border border-signal/20 bg-signal/[0.04] p-4">
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
                       <div className="text-sm font-medium tracking-tight text-ink">{p.playbook.name}</div>
@@ -168,7 +181,7 @@ export function Governance() {
                         <span>{timeAgo(p.ts)}</span>
                       </div>
                     </div>
-                    <span className="rounded-md bg-black/[0.05] px-2 py-0.5 font-mono text-2xs text-ink-2">
+                    <span className="rounded-md bg-surface-2 px-2 py-0.5 font-mono text-2xs text-ink-2">
                       {p.playbook.hitl_mode} · {p.playbook.reversible ? "reversible" : "not reversible"}
                     </span>
                   </div>
@@ -176,7 +189,7 @@ export function Governance() {
                   {p.playbook.steps.length > 0 && (
                     <div className="mt-2.5 flex flex-wrap items-center gap-1.5 font-mono text-2xs text-ink-2">
                       {p.playbook.steps.map((s, i) => (
-                        <span key={i} className="rounded-md bg-black/[0.05] px-2 py-0.5">
+                        <span key={i} className="rounded-md bg-surface-2 px-2 py-0.5">
                           {s.action}
                         </span>
                       ))}
@@ -184,7 +197,7 @@ export function Governance() {
                   )}
 
                   {p.rationale && (
-                    <div className="mt-2.5 rounded-lg bg-black/[0.03] p-2.5 text-2xs leading-relaxed text-ink-2">
+                    <div className="mt-2.5 rounded-lg bg-surface-2 p-2.5 text-2xs leading-relaxed text-ink-2">
                       <span className="font-mono text-ink-3">rationale: </span>
                       {p.rationale}
                     </div>
@@ -201,7 +214,7 @@ export function Governance() {
                     <button
                       onClick={() => decide(p, "rejected")}
                       disabled={decidingId === p.id}
-                      className="flex items-center gap-1.5 rounded-full border border-black/[0.10] bg-black/[0.04] px-4 py-2 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-black/[0.06] active:scale-[0.97] disabled:opacity-50"
+                      className="flex items-center gap-1.5 rounded-full border border-line-strong bg-surface-2 px-4 py-2 text-sm text-ink-2 transition-all duration-300 ease-fluid hover:bg-surface-3 active:scale-[0.97] disabled:opacity-50"
                     >
                       <X size={14} weight="bold" /> Reject
                     </button>
@@ -211,7 +224,7 @@ export function Governance() {
             </div>
           )}
 
-          <div className="mt-3 border-t border-black/[0.06] pt-3 font-mono text-2xs text-ink-3">
+          <div className="mt-3 border-t border-line pt-3 font-mono text-2xs text-ink-3">
             Approve registers the drafted playbook into the live registry (RBAC-gated, same as any approval). Reject
             discards it. Both are audited.
           </div>
@@ -233,26 +246,26 @@ export function Governance() {
             </div>
             <div className="space-y-1">
               {auditSorted.slice(0, shown).map((a, i) => (
-                <div key={i} className="grid grid-cols-[auto_1fr_auto] items-center gap-3 rounded-lg px-2 py-2 font-mono text-2xs transition-colors hover:bg-black/[0.03]">
+                <div key={i} className="grid grid-cols-[auto_1fr_auto] items-center gap-3 rounded-lg px-2 py-2 font-mono text-2xs transition-colors hover:bg-surface-2">
                   <span className="text-ink-3">{timeAgo(a.ts)}</span>
                   <span className="truncate">
                     <span className="text-ink-2">{a.actor}</span>
                     <span className="text-ink-3"> {a.action} </span>
                     <span className="text-ink">{a.resource}</span>
                   </span>
-                  <span className={`${a.decision === "deny" ? "text-sev-crit" : a.decision === "pending" ? "text-sev-warn" : "text-sev-ok"}`}>{a.decision}</span>
+                  <span className={decisionTone(a.decision)}>{a.decision}</span>
                 </div>
               ))}
             </div>
             {shown < auditSorted.length && (
-              <button onClick={() => setShown((n) => n + PAGE)} className="mt-3 w-full rounded-xl border border-black/[0.08] bg-black/[0.03] py-2 font-mono text-2xs text-ink-2 transition-colors hover:bg-black/[0.05]">
+              <button onClick={() => setShown((n) => n + PAGE)} className="mt-3 w-full rounded-xl border border-line-strong bg-surface-2 py-2 font-mono text-2xs text-ink-2 transition-colors hover:bg-surface-2">
                 Load {Math.min(PAGE, auditSorted.length - shown)} more
               </button>
             )}
             {auditSorted.length === 0 && (
-              <div className="rounded-2xl border border-black/[0.06] p-8 text-center text-ink-3">No audit records yet — decisions appear here as the gate evaluates them.</div>
+              <div className="rounded-lg border border-line p-8 text-center text-ink-3">No audit records yet — decisions appear here as the gate evaluates them.</div>
             )}
-            <div className="mt-3 border-t border-black/[0.06] pt-3 font-mono text-2xs text-ink-3">
+            <div className="mt-3 border-t border-line pt-3 font-mono text-2xs text-ink-3">
               NIST AI RMF · EU AI Act · DORA — every entry is append-only.
             </div>
           </Bezel>
@@ -270,10 +283,10 @@ export function Governance() {
                 {[
                   { role: "operator", grant: "enrich · diagnose", who: "rca-service" },
                   { role: "operator", grant: "execute playbook:*", who: "action-service" },
-                  { role: "approver", grant: "approve · reject", who: "oncall-alice" },
+                  { role: "approver", grant: "approve · reject", who: OPERATOR_NAME },
                   { role: "coe-admin", grant: "graduate playbook:*", who: "feedback-service" },
                 ].map((r, i) => (
-                  <div key={i} className="flex items-center gap-2 rounded-lg bg-black/[0.03] px-3 py-2">
+                  <div key={i} className="flex items-center gap-2 rounded-lg bg-surface-2 px-3 py-2">
                     <span className="w-20 text-signal-dim">{r.role}</span>
                     <span className="flex-1 text-ink-2">{r.grant}</span>
                     <span className="text-ink-3">{r.who}</span>
@@ -290,10 +303,10 @@ export function Governance() {
               </div>
               <div className="space-y-2">
                 {playbooks.map((p) => (
-                  <div key={p.id} className="flex items-center gap-2 rounded-lg bg-black/[0.03] px-3 py-2.5">
+                  <div key={p.id} className="flex items-center gap-2 rounded-lg bg-surface-2 px-3 py-2.5">
                     <span className={`h-1.5 w-1.5 rounded-full ${p.reversible ? "bg-sev-ok" : "bg-sev-crit"}`} />
                     <span className="flex-1 text-sm text-ink">{p.name}</span>
-                    <span className={`rounded-md px-2 py-0.5 font-mono text-2xs ${p.graduated ? "bg-signal/10 text-signal-dim" : "bg-black/[0.05] text-ink-2"}`}>{p.hitl_mode}</span>
+                    <span className={`rounded-md px-2 py-0.5 font-mono text-2xs ${isGraduated(p) ? "bg-signal/10 text-signal-dim" : "bg-surface-2 text-ink-2"}`}>{p.hitl_mode}</span>
                   </div>
                 ))}
               </div>
