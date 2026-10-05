@@ -230,6 +230,7 @@ jobs:
             uid=$(docker compose -f deploy/docker-compose.yml exec -T "$svc" id -u)
             [ "$uid" != "0" ] || { echo " ✗ $svc runs as root"; exit 1; }
             echo " ✓ $svc uid=$uid"
+          done
           # Logs + metrics UI: Loki ready, Grafana up with all three datasources
           # healthy, and Alloy actually shipping container logs into Loki.
           for url in http://localhost:3100/ready http://localhost:3000/api/health; do
