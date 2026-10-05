@@ -85,14 +85,10 @@ jobs:
           helm template t "$CHART" --set postgres.existingSecret=my-pg > /dev/null
 
   # --- Dependency audits -----------------------------------------------------
-  # ADVISORY for now (continue-on-error): the lockfiles already carry known
-  # findings, and blocking every PR on pre-existing advisories would just get
-  # the check disabled. Clear the backlog, then delete `continue-on-error` to
-  # make these gate merges.
+  # Blocking: a known vulnerability in a locked dependency fails the PR.
   audit-python:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -103,7 +99,6 @@ jobs:
   audit-npm:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -113,8 +108,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      # Audits the lockfile directly — no install needed.
-      - run: npm audit --audit-level=high
+      # Audits the lockfile directly — no install needed. --omit=dev scopes it to
+      # what ships to the browser: the remaining dev-only findings are the
+      # braces/micromatch chain under tailwindcss 3 (build-time glob matching),
+      # whose only fix is the breaking tailwindcss 4 migration.
+      - run: npm audit --omit=dev --audit-level=high
         working-directory: ${{ matrix.dir }}
 
   slim-boundary:
