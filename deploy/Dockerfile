@@ -1,7 +1,23 @@
 # syntax=docker/dockerfile:1
+
+# ---- sources: the app tree, copied once and shared by both runtime targets ----
+FROM scratch AS sources
+COPY common/ /app/common/
+COPY services/ /app/services/
+COPY policies/ /app/policies/
+COPY config/ /app/config/
+COPY deploy/playbooks/ /app/data/playbooks/
+# Alembic config + migration scripts, so the one-shot `migrate` compose service
+# can run `alembic upgrade head` against Postgres before the store services boot.
+COPY alembic.ini /app/alembic.ini
+COPY alembic/ /app/alembic/
+
 FROM python:3.11-slim AS builder-base
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
+
+# Unprivileged runtime user. Numeric so k8s `runAsNonRoot` can verify it.
+RUN useradd --uid 10001 --create-home app
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
@@ -12,16 +28,11 @@ COPY pyproject.toml uv.lock ./
 FROM builder-base AS base
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY common/ ./common/
-COPY services/ ./services/
-COPY policies/ ./policies/
-COPY config/ ./config/
-COPY deploy/playbooks/ ./data/playbooks/
-# Alembic config + migration scripts, so the one-shot `migrate` compose service
-# can run `alembic upgrade head` against Postgres before the store services boot.
-COPY alembic.ini ./alembic.ini
-COPY alembic/ ./alembic/
-RUN uv sync --frozen --no-dev --no-install-project
+COPY --from=sources /app/ ./
+# The only paths services write to (file stores, the shared rca-context volume).
+# Pre-creating rca_context app-owned makes a fresh named volume inherit that owner.
+RUN mkdir -p data/rca_context && chown -R app:app data
+USER 10001
 
 # Launch uvicorn directly from the built venv. Using `uv run` here would try to
 # re-sync the environment at container startup (re-resolving/downloading deps),
@@ -36,14 +47,9 @@ CMD ["sh", "-c", "uvicorn \"$SERVICE_MODULE\" --host 0.0.0.0 --port \"$PORT\""]
 FROM builder-base AS full
 RUN uv sync --frozen --no-dev --extra ml --extra k8s --no-install-project
 
-COPY common/ ./common/
-COPY services/ ./services/
-COPY policies/ ./policies/
-COPY config/ ./config/
-COPY deploy/playbooks/ ./data/playbooks/
-COPY alembic.ini ./alembic.ini
-COPY alembic/ ./alembic/
-RUN uv sync --frozen --no-dev --extra ml --extra k8s --no-install-project
+COPY --from=sources /app/ ./
+RUN mkdir -p data/rca_context .cache && chown -R app:app data .cache
+USER 10001
 
 # torch is used for INFERENCE ONLY (sentence-transformers .encode for cosine fit;
 # no training/CUDA). pyproject.toml pins torch to the CPU-only PyTorch index
@@ -54,6 +60,7 @@ RUN /app/.venv/bin/python -c "import torch; assert torch.version.cuda is None an
 
 # Pre-cache all-MiniLM-L6-v2 (~90MB) so RUNBOOK_SELECTOR_MODE=embedding needs no
 # runtime HuggingFace egress. Set a stable cache dir the runtime also uses.
+# Runs as the app user (above) so the cache is owned by the user that reads it.
 # NOTE: PATH isn't pointed at /app/.venv/bin until below, so invoke the venv's
 # python explicitly here (bare `python` would hit the base image's system
 # interpreter, which has none of these packages installed).

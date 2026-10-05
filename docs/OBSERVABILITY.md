@@ -166,3 +166,18 @@ For a real cluster deploy, map the two probes to their matching Kubernetes probe
 outage; `readinessProbe -> /ready` pulls a pod out of the Service's endpoints while a dependency
 is unreachable, without killing it, and lets it back in when the dependency recovers. See
 [deploy/k8s/README.md](../deploy/k8s/README.md).
+
+## 4. Platform self-metrics (`/_metrics`)
+
+Every platform service built with `services.base.create_app` exposes Prometheus
+metrics about *itself* at `/_metrics` (not `/metrics` — read and feedback already
+serve token-gated JSON business metrics there):
+
+- `intelliops_http_requests_total{service,method,path,status}`
+- `intelliops_http_request_duration_seconds{service,method,path}` (histogram)
+
+`path` is the matched route template, so path parameters do not add label
+cardinality. Like `/health` and `/ready`, `/_metrics` is exempt from `AUTH_MODE`
+so Prometheus can scrape it without a token. The `intelliops` scrape job is in
+`deploy/prometheus.yml` (compose) and the chart's `prometheus.yaml` (k8s).
+Meridian opts out (`metrics=False`): it is the monitored workload, not the platform.
