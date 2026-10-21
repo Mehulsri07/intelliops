@@ -131,6 +131,16 @@ dashboard, viewable without logging in. See [docs/OBSERVABILITY.md](docs/OBSERVA
 ./scripts/reset.sh
 ```
 
+**Make the whole console look live:** `scripts/live_traffic.py` runs three
+request streams and a staggered schedule of faults across five services (plus a
+deploy marker and two operator approvals), so a dozen incidents, remediation
+outcomes and audit records build up over about eight minutes:
+
+```bash
+uv run python scripts/live_traffic.py            # 14 minutes; faults stay on afterwards
+uv run python scripts/live_traffic.py --clear    # recover every faulted service
+```
+
 Detection takes **15–30 seconds** — that's a real Prometheus scrape cycle plus River needing a few samples to flag the anomaly, not a mock timer.
 
 > **For a step-by-step demo walkthrough** (including real kind-cluster remediation), see [docs/DEMO.md](docs/DEMO.md).
