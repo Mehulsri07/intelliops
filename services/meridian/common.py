@@ -52,7 +52,7 @@ from prometheus_client import (
 from pydantic import BaseModel
 
 from common.auth import require_token
-from common.telemetry import jitter, jitter_enabled
+from common.telemetry import jitter_enabled, shape
 from services.base import create_app
 
 CPU_HEALTHY = 18.0
@@ -338,7 +338,7 @@ def make_meridian_service(name: str, domain_routes=None, registry: CollectorRegi
     jittering = jitter_enabled()
 
     def publish(gauge: Gauge, metric: str, value: float) -> None:
-        gauge.set(jitter(metric, name, value) if jittering else value)
+        gauge.set(shape(metric, name, value) if jittering else value)
 
     @app.get("/metrics")
     def metrics() -> Response:

@@ -32,7 +32,19 @@ Properties that matter
   learned baseline.
 - **Shaped like telemetry.** Two sine components at different periods give the
   slow drift and the medium-frequency ripple; a hash-derived grain term adds
-  per-scrape texture so the curve is not suspiciously smooth either.
+  per-scrape texture so the curve is not suspiciously smooth either. Each
+  sine's PHASE wanders on smooth value noise, so the curve never repeats: plain
+  sines beat into a visibly regular pattern on a 15-minute chart. The sine
+  shape itself is kept on purpose: its values sit near the extremes, so the
+  spread a median/MAD detector learns covers the whole swing. Replacing it with
+  value noise (tried) looked as natural but put the tails outside 3 MADs and
+  produced ~200 false threshold crossings per metric in six idle hours; the
+  wobbled sine produces none, measured the same way.
+- **No instant steps.** `shape()` also eases each gauge toward its target with a
+  per-metric time constant, so a fault onset climbs over tens of seconds and a
+  recovery decays, the way a real saturating CPU or draining queue does,
+  instead of a vertical edge between two ruled lines. This is the one stateful
+  part, and it only delays a value; it never changes where it settles.
 - **Phase-separated per service.** Without this, five services sharing one
   baseline draw five identical curves, which looks exactly as synthetic as five
   flat lines.
@@ -82,6 +94,23 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "meridian_error_rate": (0.0, 1.0),
 }
 
+# How fast each metric follows a change in its target, in seconds (the time to
+# cover ~63% of a step). Memory and disk move slowly, latency and errors react
+# within a scrape or two. Kept well under a minute so detection is delayed by
+# seconds, not by a correlation window.
+_TAU: dict[str, float] = {
+    "cpu_usage": 20.0,
+    "memory_usage_mb": 45.0,
+    "latency_p50_ms": 10.0,
+    "latency_p99_ms": 12.0,
+    "request_rate": 15.0,
+    "saturation": 18.0,
+    "queue_depth": 12.0,
+    "db_pool_in_use": 15.0,
+    "disk_usage_percent": 60.0,
+    "meridian_error_rate": 8.0,
+}
+
 # Periods in seconds. Both are deliberately SHORTER than the span of the
 # correlator's learning window, and that constraint is tighter than it looks:
 # ingestion polls Prometheus every 5s and publishes one event per service, and
@@ -93,6 +122,11 @@ _BOUNDS: dict[str, tuple[float, float]] = {
 # crossings per service per window; at 150s, at most one.
 _SLOW_PERIOD = 150.0
 _FAST_PERIOD = 40.0
+# Phase wobble: how far (radians) and how slowly (seconds between noise
+# points) each sine's phase drifts. Enough to break the repetition (one-period
+# autocorrelation about 0.5 -> 0.2) without changing the value distribution.
+_WOBBLE = (4.0, 2.5)
+_WOBBLE_SPACING = 300.0
 # Grain is quantised to this many seconds so that one Prometheus scrape (15s)
 # lands on its own value and the texture does not smear.
 _GRAIN_TICK = 5.0
@@ -118,6 +152,43 @@ def _unit(seed: str) -> float:
     return int.from_bytes(digest[:4], "big") / 4294967296.0
 
 
+def _noise(seed: str, t: float, spacing: float) -> float:
+    """Smooth, non-repeating noise in [-1, 1]: hashed lattice values every
+    `spacing` seconds, joined with a smoothstep so the curve has no corners."""
+    x = t / spacing
+    i = math.floor(x)
+    f = x - i
+    a = _unit(f"{seed}|{i}") * 2.0 - 1.0
+    b = _unit(f"{seed}|{i + 1}") * 2.0 - 1.0
+    return a + (b - a) * f * f * (3.0 - 2.0 * f)
+
+
+# (service, metric) -> (eased value, time it was computed). Per process, which
+# is per service: a restart starts from the current target, with no ramp.
+_eased: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+def ease(metric: str, service: str, target: float, now: float | None = None) -> float:
+    """Move this gauge part of the way toward `target`, exponentially in time."""
+    tau = _TAU.get(metric)
+    if tau is None:
+        return target
+    t = time.time() if now is None else now
+    prev = _eased.get((service, metric))
+    if prev is None:
+        value = target
+    else:
+        value, t0 = prev
+        value += (target - value) * (1.0 - math.exp(-max(t - t0, 0.0) / tau))
+    _eased[(service, metric)] = (value, t)
+    return value
+
+
+def shape(metric: str, service: str, value: float, now: float | None = None) -> float:
+    """What a live deployment publishes: eased toward `value`, then jittered."""
+    return jitter(metric, service, ease(metric, service, value, now), now)
+
+
 def jitter(metric: str, service: str, value: float, now: float | None = None) -> float:
     """Return `value` nudged onto a plausible idle curve.
 
@@ -133,8 +204,17 @@ def jitter(metric: str, service: str, value: float, now: float | None = None) ->
         return value
 
     t = time.time() if now is None else now
-    slow = math.sin(2 * math.pi * t / _SLOW_PERIOD + _unit(f"{service}|{metric}|slow") * math.tau)
-    fast = math.sin(2 * math.pi * t / _FAST_PERIOD + _unit(f"{service}|{metric}|fast") * math.tau)
+    key = f"{service}|{metric}"
+    slow = math.sin(
+        2 * math.pi * t / _SLOW_PERIOD
+        + _unit(f"{key}|slow") * math.tau
+        + _WOBBLE[0] * _noise(f"{key}|slow-phase", t, _WOBBLE_SPACING)
+    )
+    fast = math.sin(
+        2 * math.pi * t / _FAST_PERIOD
+        + _unit(f"{key}|fast") * math.tau
+        + _WOBBLE[1] * _noise(f"{key}|fast-phase", t, _WOBBLE_SPACING / 3)
+    )
     grain = _unit(f"{service}|{metric}|{int(t // _GRAIN_TICK)}") * 2.0 - 1.0
 
     # Weights sum to 1.0, so `deviation` stays in [-1, 1] and the result stays
@@ -146,12 +226,13 @@ def jitter(metric: str, service: str, value: float, now: float | None = None) ->
     # four, which is an incident.
     deviation = 0.50 * slow + 0.40 * fast + 0.10 * grain
 
-    # The swing is proportional to how much ROOM the value has, not just to the
-    # value. A percentage sitting at 92 has 8 points of headroom, so it wanders
-    # by about a point; the same metric at 18 wanders by two. Without this a
-    # faulted gauge would swing past 100 and clip flat against the ceiling,
-    # which looks worse on a chart than no jitter at all.
+    # The swing is proportional to the value. Near a ceiling the overshoot is
+    # REFLECTED back inside rather than clipped: a CPU pinned at 92% then reads
+    # 80-100 and bounces off the top like a saturated host, where scaling the
+    # swing by the 8 points of headroom (the previous rule) drew a flat line
+    # and clipping would draw a flat plateau at 100.
     low, high = _BOUNDS.get(metric, (0.0, math.inf))
-    room = min(base - low, high - base) if high != math.inf else base
-    out = base + amplitude * room * deviation
+    out = base + amplitude * (base - low) * deviation
+    if out > high:
+        out = 2 * high - out
     return min(max(out, low), high)

@@ -4,9 +4,11 @@ Everything goes through the real services; nothing is mocked. Concurrently:
 
   - steady user traffic: Meridian gateway submissions + report reads, and
     demo-app /work, each at its own Poisson rate
+  - traffic that swells and dips over ~10 minutes, with occasional bursts
   - a staggered fault schedule across five services (saturation, memory leak,
     demo-app break, DB pool exhaustion, latency, and one signal no RCA rule
-    knows), so the correlator sees distinct incidents arrive one after another
+    knows), so the correlator sees distinct incidents arrive one after another,
+    and two of them recover part-way through
   - a deploy marker before the memory leak, so RCA has a rollback hypothesis
   - two approvals decided by the demo operator, so outcomes and the audit
     trail fill in
@@ -28,6 +30,7 @@ AUTH_MODE=token, set AUTH_TOKEN (sent as a bearer header), as for reset.sh.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import threading
@@ -59,8 +62,23 @@ def post(url: str, **kw) -> None:
         log(f"POST {url} failed: {e}")
 
 
+# Traffic is not flat in real life: a slow swell over ~10 minutes, plus the
+# odd burst (a batch job, a retry storm) at two to three times the rate for
+# half a minute. Shared by every stream, so they rise and fall together.
+_burst_until = 0.0
+
+
+def load_factor(t: float) -> float:
+    global _burst_until
+    if t >= _burst_until and random.random() < 0.004:  # ~one burst per 4 minutes
+        _burst_until = t + random.uniform(20, 45)
+    swell = 1.0 + 0.35 * math.sin(2 * math.pi * t / 600) + 0.15 * math.sin(2 * math.pi * t / 137)
+    return swell * (random.uniform(2.0, 3.0) if t < _burst_until else 1.0)
+
+
 def stream(name: str, call: Callable[[], object], rate_hz: float) -> None:
-    """Call `call` forever at a Poisson rate; errors are expected under faults."""
+    """Call `call` forever at a Poisson rate shaped by `load_factor`; errors are
+    expected under faults."""
     n = 0
     while not stop.is_set():
         try:
@@ -70,7 +88,7 @@ def stream(name: str, call: Callable[[], object], rate_hz: float) -> None:
         n += 1
         if n % 500 == 0:
             log(f"[{name}] {n} requests")
-        time.sleep(random.expovariate(rate_hz))
+        time.sleep(random.expovariate(rate_hz * load_factor(time.monotonic())))
 
 
 def submit() -> None:
@@ -124,10 +142,14 @@ SCHEDULE: list[tuple[int, Callable[[], None]]] = [
     (160, fault("aggregation", "memory_leak")),
     (230, lambda: post(f"{DEMO}/break")),
     (300, fault("reporting", "db_exhaustion")),
+    # Not everything stays broken: validation recovers on its own and the
+    # demo-app gets fixed, so the charts show incidents resolving too.
+    (330, lambda: post(f"{GW}/api/ops/clear", json={"service": "validation"})),
     (360, approve_one),
     (390, fault("gateway", "latency", 0.8)),
     (450, fault("reporting", "unknown_signal")),
     (480, approve_one),
+    (540, lambda: post(f"{DEMO}/fix")),
 ]
 
 

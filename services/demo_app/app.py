@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 
 from common.auth import require_token
-from common.telemetry import jitter, jitter_enabled
+from common.telemetry import jitter_enabled, shape
 
 app = FastAPI(title="IntelliOps · demo-app")
 
@@ -107,7 +107,7 @@ def _set_gauges(*, broken: bool) -> None:
     # charts show telemetry rather than a ruled line; tests leave it off and
     # keep asserting the constants exactly. See common/telemetry.py.
     def publish(gauge, metric: str, value: float) -> None:
-        gauge.set(jitter(metric, "demo-app", value) if jitter_enabled() else value)
+        gauge.set(shape(metric, "demo-app", value) if jitter_enabled() else value)
 
     publish(_cpu, "cpu_usage", _CPU_BROKEN if broken else _CPU_HEALTHY)
     publish(

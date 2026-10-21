@@ -241,6 +241,7 @@ services:
     <<: *service
     environment:
       SERVICE_MODULE: services.demo_app.app:app
+      INTELLIOPS_TELEMETRY_JITTER: "1"
       PORT: "8080"
     ports:
       - "8080:8080"
@@ -355,6 +356,7 @@ services:
       INTELLIOPS_REDIS_URL: redis://redis:6379
       INTELLIOPS_LOG_FORMAT: json
       SERVICE_MODULE: services.meridian.gateway.app:app
+      INTELLIOPS_TELEMETRY_JITTER: "1"
       PORT: "8000"
       INTELLIOPS_RCA_CONTEXT_PATH: /app/data/rca_context
       # /api/ops/metrics (Task 2) queries Prometheus directly via httpx —
@@ -382,6 +384,7 @@ services:
       INTELLIOPS_REDIS_URL: redis://redis:6379
       INTELLIOPS_LOG_FORMAT: json
       SERVICE_MODULE: services.meridian.validation.app:app
+      INTELLIOPS_TELEMETRY_JITTER: "1"
       PORT: "8000"
     ports:
       - "8011:8000"
@@ -398,6 +401,7 @@ services:
       INTELLIOPS_REDIS_URL: redis://redis:6379
       INTELLIOPS_LOG_FORMAT: json
       SERVICE_MODULE: services.meridian.aggregation.app:app
+      INTELLIOPS_TELEMETRY_JITTER: "1"
       PORT: "8000"
     ports:
       - "8012:8000"
@@ -414,6 +418,7 @@ services:
       INTELLIOPS_REDIS_URL: redis://redis:6379
       INTELLIOPS_LOG_FORMAT: json
       SERVICE_MODULE: services.meridian.reporting.app:app
+      INTELLIOPS_TELEMETRY_JITTER: "1"
       PORT: "8000"
     ports:
       - "8013:8000"
